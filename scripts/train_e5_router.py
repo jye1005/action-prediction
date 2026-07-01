@@ -48,7 +48,7 @@ def load_labels(path):
         return {row["id"]: row["action"] for row in csv.DictReader(f)}
 
 
-def build_xy(data_dir, max_history):
+def build_xy(data_dir, max_history, max_samples=None, seed=42):
     samples = load_jsonl(Path(data_dir) / "train.jsonl")
     labels = load_labels(Path(data_dir) / "train_labels.csv")
     texts = []
@@ -57,7 +57,24 @@ def build_xy(data_dir, max_history):
         action = labels[sample["id"]]
         texts.append(render_sample(sample, max_history=max_history))
         y.append(LABEL2ID[action])
-    return texts, np.array(y, dtype=np.int64)
+    y = np.array(y, dtype=np.int64)
+    if max_samples and max_samples < len(texts):
+        rng = np.random.default_rng(seed)
+        chosen = []
+        per_class = max(1, max_samples // len(ACTION_CLASSES))
+        for label_id in range(len(ACTION_CLASSES)):
+            idx = np.flatnonzero(y == label_id)
+            take = min(per_class, len(idx))
+            chosen.extend(rng.choice(idx, size=take, replace=False).tolist())
+        if len(chosen) < max_samples:
+            remaining = np.setdiff1d(np.arange(len(texts)), np.array(chosen), assume_unique=False)
+            take = min(max_samples - len(chosen), len(remaining))
+            chosen.extend(rng.choice(remaining, size=take, replace=False).tolist())
+        chosen = np.array(chosen[:max_samples])
+        rng.shuffle(chosen)
+        texts = [texts[i] for i in chosen]
+        y = y[chosen]
+    return texts, y
 
 
 def make_class_weights(y):
@@ -83,6 +100,7 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-samples", type=int, default=None)
     args = parser.parse_args()
 
     import torch
@@ -98,7 +116,7 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    texts, y = build_xy(args.data_dir, args.max_history)
+    texts, y = build_xy(args.data_dir, args.max_history, max_samples=args.max_samples, seed=args.seed)
     train_texts, val_texts, y_train, y_val = train_test_split(
         texts,
         y,
