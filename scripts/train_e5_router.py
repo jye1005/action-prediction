@@ -101,6 +101,7 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--val-size", type=float, default=0.2)
     args = parser.parse_args()
 
     import torch
@@ -120,7 +121,7 @@ def main():
     train_texts, val_texts, y_train, y_val = train_test_split(
         texts,
         y,
-        test_size=0.15,
+        test_size=args.val_size,
         random_state=args.seed,
         stratify=y,
     )
