@@ -102,6 +102,16 @@ def save_submission(path, fieldnames, rows):
         writer.writerows(rows)
 
 
+def load_logit_bias(model_dir, id2label):
+    path = Path(model_dir) / "logit_bias.json"
+    if not path.exists():
+        return None
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+    bias_map = payload.get("bias", {})
+    return [float(bias_map.get(id2label[idx], 0.0)) for idx in range(len(id2label))]
+
+
 def main():
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -123,6 +133,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
+    bias_values = load_logit_bias(model_dir, model.config.id2label)
+    bias = torch.tensor(bias_values, dtype=torch.float32, device=device) if bias_values is not None else None
 
     samples = load_jsonl(data_dir / "test.jsonl")
     ids = [sample["id"] for sample in samples]
@@ -151,6 +163,8 @@ def main():
             batch = {k: v.to(device) for k, v in batch.items()}
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 logits = model(**batch).logits
+            if bias is not None:
+                logits = logits.float() + bias
             pred_ids = torch.argmax(logits, dim=-1).cpu().numpy().tolist()
             preds.extend([model.config.id2label[int(i)] for i in pred_ids])
 
@@ -164,4 +178,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
