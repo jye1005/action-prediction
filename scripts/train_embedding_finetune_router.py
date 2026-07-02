@@ -106,6 +106,13 @@ def evaluate(model, loader, device, use_amp, amp_dtype):
     return f1_score(gold, preds, labels=list(range(len(ACTION_CLASSES))), average="macro", zero_division=0)
 
 
+def ensure_pad_token(tokenizer, model=None):
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if model is not None and tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default="./data")
@@ -154,6 +161,7 @@ def main():
         local_files_only=args.local_files_only,
         trust_remote_code=args.trust_remote_code,
     )
+    ensure_pad_token(tokenizer)
     model_kwargs = {
         "num_labels": len(ACTION_CLASSES),
         "id2label": ID2LABEL,
@@ -164,6 +172,7 @@ def main():
     if args.attn_implementation:
         model_kwargs["attn_implementation"] = args.attn_implementation
     model = AutoModelForSequenceClassification.from_pretrained(args.model_name, **model_kwargs)
+    ensure_pad_token(tokenizer, model)
     model.to(device)
 
     collator = DataCollatorWithPadding(tokenizer=tokenizer)

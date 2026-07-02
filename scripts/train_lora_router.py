@@ -82,11 +82,18 @@ def infer_lora_targets(model, requested):
     if requested != "auto":
         return split_csv(requested)
     module_names = [name.split(".")[-1] for name, _ in model.named_modules()]
-    candidates = ["Wqkv", "Wo", "query", "key", "value", "dense"]
+    candidates = ["Wqkv", "Wo", "q_proj", "k_proj", "v_proj", "o_proj", "query", "key", "value", "dense"]
     targets = [name for name in candidates if name in module_names]
     if not targets:
         raise ValueError("LoRA target module을 자동으로 찾지 못했습니다. --target-modules로 직접 지정하세요.")
     return targets
+
+
+def ensure_pad_token(tokenizer, model=None):
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if model is not None and tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
 
 
 def evaluate(model, loader, device, use_amp):
@@ -162,6 +169,7 @@ def main():
         local_files_only=args.local_files_only,
         trust_remote_code=args.trust_remote_code,
     )
+    ensure_pad_token(tokenizer)
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name,
         num_labels=len(ACTION_CLASSES),
@@ -171,6 +179,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
         attn_implementation="eager",
     )
+    ensure_pad_token(tokenizer, model)
 
     target_modules = infer_lora_targets(model, args.target_modules)
     print(f"lora_target_modules={target_modules}")

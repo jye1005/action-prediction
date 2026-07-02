@@ -55,6 +55,13 @@ def load_base_model_name(model_dir, fallback):
         return json.load(f)["base_model"]
 
 
+def ensure_pad_token(tokenizer, model=None):
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if model is not None and tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+
 def predict_logits(model_dir, base_model_name, texts, max_length, batch_size, local_files_only, trust_remote_code):
     import torch
     from peft import PeftModel
@@ -62,6 +69,7 @@ def predict_logits(model_dir, base_model_name, texts, max_length, batch_size, lo
     from transformers import AutoModelForSequenceClassification, AutoTokenizer, DataCollatorWithPadding
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=local_files_only)
+    ensure_pad_token(tokenizer)
     base_model = AutoModelForSequenceClassification.from_pretrained(
         base_model_name,
         num_labels=len(ACTION_CLASSES),
@@ -71,6 +79,7 @@ def predict_logits(model_dir, base_model_name, texts, max_length, batch_size, lo
         trust_remote_code=trust_remote_code,
         attn_implementation="eager",
     )
+    ensure_pad_token(tokenizer, base_model)
     model = PeftModel.from_pretrained(base_model, model_dir, local_files_only=local_files_only)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)

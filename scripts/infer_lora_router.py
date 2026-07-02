@@ -40,6 +40,13 @@ def load_logit_bias(model_dir, id2label):
     return [float(bias_map.get(id2label[idx], 0.0)) for idx in range(len(id2label))]
 
 
+def ensure_pad_token(tokenizer, model=None):
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if model is not None and tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default="./data")
@@ -66,12 +73,14 @@ def main():
             base_model_name = json.load(f)["base_model"]
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=args.local_files_only)
+    ensure_pad_token(tokenizer)
     base_model = AutoModelForSequenceClassification.from_pretrained(
         base_model_name,
         local_files_only=args.local_files_only,
         trust_remote_code=args.trust_remote_code,
         attn_implementation="eager",
     )
+    ensure_pad_token(tokenizer, base_model)
     model = PeftModel.from_pretrained(base_model, model_dir, local_files_only=args.local_files_only)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)

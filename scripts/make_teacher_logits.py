@@ -38,12 +38,20 @@ def is_lora_model(model_dir):
     return (Path(model_dir) / "adapter_config.json").exists()
 
 
+def ensure_pad_token(tokenizer, model=None):
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if model is not None and tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+
 def load_teacher(args):
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
     model_dir = Path(args.model_dir)
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=args.local_files_only)
+    ensure_pad_token(tokenizer)
     if is_lora_model(model_dir):
         from peft import PeftModel
 
@@ -59,6 +67,7 @@ def load_teacher(args):
             trust_remote_code=args.trust_remote_code,
             attn_implementation=args.attn_implementation,
         )
+        ensure_pad_token(tokenizer, base_model)
         model = PeftModel.from_pretrained(base_model, model_dir, local_files_only=args.local_files_only)
     else:
         model = AutoModelForSequenceClassification.from_pretrained(
@@ -66,6 +75,7 @@ def load_teacher(args):
             local_files_only=args.local_files_only,
             attn_implementation=args.attn_implementation,
         )
+        ensure_pad_token(tokenizer, model)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
