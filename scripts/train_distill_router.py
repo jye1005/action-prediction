@@ -1,0 +1,306 @@
+import argparse
+import csv
+import json
+import math
+import os
+import sys
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+from sklearn.metrics import f1_score
+from sklearn.model_selection import GroupKFold
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT_DIR / "src"))
+
+from action_router.constants import ACTION_CLASSES, ID2LABEL, LABEL2ID
+from action_router.features import render_granite_sample, session_group
+
+
+class DistillDataset:
+    def __init__(self, texts, labels, teacher_logits, tokenizer, max_length):
+        self.texts = texts
+        self.labels = labels
+        self.teacher_logits = teacher_logits
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        encoded = self.tokenizer(
+            self.texts[idx],
+            truncation=True,
+            max_length=self.max_length,
+            padding=False,
+        )
+        encoded["labels"] = int(self.labels[idx])
+        encoded["teacher_logits"] = self.teacher_logits[idx].astype(np.float32)
+        return encoded
+
+
+class EvalDataset:
+    def __init__(self, texts, labels, tokenizer, max_length):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        encoded = self.tokenizer(
+            self.texts[idx],
+            truncation=True,
+            max_length=self.max_length,
+            padding=False,
+        )
+        encoded["labels"] = int(self.labels[idx])
+        return encoded
+
+
+def load_jsonl(path):
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def load_labels(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        return {row["id"]: row["action"] for row in csv.DictReader(f)}
+
+
+def build_data(data_dir, max_history_events):
+    samples = load_jsonl(Path(data_dir) / "train.jsonl")
+    labels = load_labels(Path(data_dir) / "train_labels.csv")
+    ids = []
+    texts = []
+    y = []
+    groups = []
+    for sample in samples:
+        sample_id = sample["id"]
+        ids.append(sample_id)
+        texts.append(render_granite_sample(sample, max_history_events=max_history_events))
+        y.append(LABEL2ID[labels[sample_id]])
+        groups.append(session_group(sample_id))
+    return (
+        np.array(ids, dtype=object),
+        np.array(texts, dtype=object),
+        np.array(y, dtype=np.int64),
+        np.array(groups, dtype=object),
+    )
+
+
+def load_teacher_logits(path, ids):
+    payload = np.load(path, allow_pickle=True)
+    logits = payload["logits"].astype(np.float32)
+    teacher_ids = payload["ids"].astype(object).tolist()
+    if teacher_ids != ids.astype(object).tolist():
+        raise ValueError("teacher logits의 id 순서가 train.jsonl과 다릅니다. logits를 다시 생성하세요.")
+    if logits.shape != (len(ids), len(ACTION_CLASSES)):
+        raise ValueError(f"teacher logits shape mismatch: {logits.shape}")
+    return logits
+
+
+def class_weights(y):
+    counts = Counter(int(v) for v in y)
+    weights = []
+    total = len(y)
+    n_classes = len(ACTION_CLASSES)
+    for label_id in range(n_classes):
+        weights.append(total / (n_classes * max(counts[label_id], 1)))
+    weights = np.array(weights, dtype=np.float32)
+    return weights / weights.mean()
+
+
+def evaluate(model, loader, device, use_amp, amp_dtype):
+    import torch
+
+    model.eval()
+    preds = []
+    gold = []
+    with torch.no_grad():
+        for batch in loader:
+            labels = batch.pop("labels").numpy().tolist()
+            batch = {k: v.to(device) for k, v in batch.items()}
+            with torch.amp.autocast("cuda", enabled=use_amp and device.type == "cuda", dtype=amp_dtype):
+                logits = model(**batch).logits
+            preds.extend(torch.argmax(logits, dim=-1).cpu().numpy().tolist())
+            gold.extend(labels)
+    return f1_score(gold, preds, labels=list(range(len(ACTION_CLASSES))), average="macro", zero_division=0)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default="./data")
+    parser.add_argument("--teacher-logits", required=True)
+    parser.add_argument("--model-name", default="intfloat/multilingual-e5-small")
+    parser.add_argument("--output-dir", default="./model/distill-router")
+    parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--n-splits", type=int, default=5)
+    parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--max-history-events", type=int, default=12)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--eval-batch-size", type=int, default=64)
+    parser.add_argument("--grad-accum", type=int, default=4)
+    parser.add_argument("--learning-rate", type=float, default=2e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup-ratio", type=float, default=0.06)
+    parser.add_argument("--temperature", type=float, default=2.0)
+    parser.add_argument("--hard-loss-weight", type=float, default=0.5)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--fp16", action="store_true", default=False)
+    parser.add_argument("--bf16", action="store_true", default=False)
+    parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--attn-implementation", default="eager")
+    args = parser.parse_args()
+
+    import torch
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader
+    from transformers import (
+        AutoModelForSequenceClassification,
+        AutoTokenizer,
+        DataCollatorWithPadding,
+        get_linear_schedule_with_warmup,
+        set_seed,
+    )
+
+    set_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ids, texts, y, groups = build_data(args.data_dir, args.max_history_events)
+    teacher_logits = load_teacher_logits(args.teacher_logits, ids)
+
+    splitter = GroupKFold(n_splits=args.n_splits)
+    splits = list(splitter.split(texts, y, groups))
+    train_idx, val_idx = splits[args.fold]
+    print(f"train={len(train_idx)} val={len(val_idx)} fold={args.fold}/{args.n_splits}")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name,
+        use_fast=True,
+        local_files_only=args.local_files_only,
+        trust_remote_code=args.trust_remote_code,
+    )
+    model_kwargs = {
+        "num_labels": len(ACTION_CLASSES),
+        "id2label": ID2LABEL,
+        "label2id": LABEL2ID,
+        "local_files_only": args.local_files_only,
+        "trust_remote_code": args.trust_remote_code,
+    }
+    if args.attn_implementation:
+        model_kwargs["attn_implementation"] = args.attn_implementation
+    model = AutoModelForSequenceClassification.from_pretrained(args.model_name, **model_kwargs)
+    model.to(device)
+
+    collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    train_loader = DataLoader(
+        DistillDataset(
+            texts[train_idx].tolist(),
+            y[train_idx],
+            teacher_logits[train_idx],
+            tokenizer,
+            args.max_length,
+        ),
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collator,
+        num_workers=2,
+    )
+    val_loader = DataLoader(
+        EvalDataset(texts[val_idx].tolist(), y[val_idx], tokenizer, args.max_length),
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=2,
+    )
+
+    weights = torch.tensor(class_weights(y[train_idx]), dtype=torch.float32, device=device)
+    criterion = torch.nn.CrossEntropyLoss(weight=weights)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    update_steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
+    total_steps = update_steps_per_epoch * args.epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=max(1, int(total_steps * args.warmup_ratio)),
+        num_training_steps=total_steps,
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=args.fp16 and device.type == "cuda")
+    use_amp = (args.fp16 or args.bf16) and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
+
+    best_f1 = -1.0
+    os.makedirs(args.output_dir, exist_ok=True)
+    temperature = args.temperature
+    hard_weight = args.hard_loss_weight
+    soft_weight = 1.0 - hard_weight
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        running_loss = 0.0
+        update_step = 0
+        for step, batch in enumerate(train_loader, start=1):
+            teacher = batch.pop("teacher_logits").to(device)
+            labels = batch.pop("labels").to(device)
+            batch = {k: v.to(device) for k, v in batch.items()}
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                student = model(**batch).logits
+                hard_loss = criterion(student, labels)
+                soft_loss = F.kl_div(
+                    F.log_softmax(student / temperature, dim=-1),
+                    F.softmax(teacher / temperature, dim=-1),
+                    reduction="batchmean",
+                ) * (temperature**2)
+                loss = (hard_weight * hard_loss + soft_weight * soft_loss) / args.grad_accum
+            scaler.scale(loss).backward()
+            running_loss += float(loss.item()) * args.grad_accum
+
+            if step % args.grad_accum == 0 or step == len(train_loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                update_step += 1
+                if update_step % 50 == 0:
+                    print(
+                        f"epoch={epoch} update={update_step}/{update_steps_per_epoch} "
+                        f"loss={running_loss / step:.4f}"
+                    )
+
+        macro_f1 = evaluate(model, val_loader, device, use_amp, amp_dtype)
+        print(f"epoch={epoch} val_macro_f1={macro_f1:.5f}")
+        if macro_f1 > best_f1:
+            best_f1 = macro_f1
+            model.save_pretrained(args.output_dir)
+            tokenizer.save_pretrained(args.output_dir)
+            with open(Path(args.output_dir) / "training_meta.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "base_model": args.model_name,
+                        "teacher_logits": args.teacher_logits,
+                        "best_val_macro_f1": best_f1,
+                        "fold": args.fold,
+                        "n_splits": args.n_splits,
+                        "max_length": args.max_length,
+                        "max_history_events": args.max_history_events,
+                        "temperature": args.temperature,
+                        "hard_loss_weight": args.hard_loss_weight,
+                        "action_classes": ACTION_CLASSES,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            print(f"saved best distill model to {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()
