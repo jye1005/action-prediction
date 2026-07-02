@@ -51,6 +51,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--max-history-events", type=int, default=12)
+    parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args()
 
     import torch
@@ -75,8 +76,9 @@ def main():
             )
 
     model_dir = Path(args.model_dir)
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
-    model = AutoModelForSequenceClassification.from_pretrained(model_dir, local_files_only=True)
+    model_name_or_path = str(model_dir) if model_dir.exists() else args.model_dir
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, local_files_only=args.local_files_only)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name_or_path, local_files_only=args.local_files_only)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
