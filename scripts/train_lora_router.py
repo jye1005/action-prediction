@@ -74,7 +74,22 @@ def class_weights(y):
     return weights / weights.mean()
 
 
-def evaluate(model, loader, device, use_fp16):
+def split_csv(value):
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def infer_lora_targets(model, requested):
+    if requested != "auto":
+        return split_csv(requested)
+    module_names = [name.split(".")[-1] for name, _ in model.named_modules()]
+    candidates = ["Wqkv", "Wo", "query", "key", "value", "dense"]
+    targets = [name for name in candidates if name in module_names]
+    if not targets:
+        raise ValueError("LoRA target module을 자동으로 찾지 못했습니다. --target-modules로 직접 지정하세요.")
+    return targets
+
+
+def evaluate(model, loader, device, use_amp):
     import torch
 
     model.eval()
@@ -84,7 +99,7 @@ def evaluate(model, loader, device, use_fp16):
         for batch in loader:
             labels = batch.pop("labels").numpy().tolist()
             batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.amp.autocast("cuda", enabled=use_fp16 and device.type == "cuda"):
+            with torch.amp.autocast("cuda", enabled=use_amp and device.type == "cuda"):
                 logits = model(**batch).logits
             preds.extend(torch.argmax(logits, dim=-1).cpu().numpy().tolist())
             gold.extend(labels)
@@ -95,7 +110,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--model-name", default="ibm-granite/granite-embedding-311m-multilingual-r2")
-    parser.add_argument("--output-dir", default="./model/granite-311m-fold0")
+    parser.add_argument("--output-dir", default="./model/granite-lora-router")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--max-length", type=int, default=512)
@@ -104,15 +119,23 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--grad-accum", type=int, default=4)
-    parser.add_argument("--learning-rate", type=float, default=2e-5)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.06)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--fp16", action="store_true", default=True)
-    parser.add_argument("--save-fp16", action="store_true", default=True)
+    parser.add_argument("--fp16", action="store_true", default=False)
+    parser.add_argument("--bf16", action="store_true", default=False)
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--target-modules", default="auto")
+    parser.add_argument("--modules-to-save", default="classifier,score,head")
+    parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args()
 
     import torch
+    from peft import LoraConfig, TaskType, get_peft_model
     from torch.utils.data import DataLoader
     from transformers import (
         AutoModelForSequenceClassification,
@@ -133,14 +156,34 @@ def main():
     y_train, y_val = y[train_idx], y[val_idx]
     print(f"train={len(train_texts)} val={len(val_texts)} fold={args.fold}/{args.n_splits}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name,
+        use_fast=True,
+        local_files_only=args.local_files_only,
+        trust_remote_code=args.trust_remote_code,
+    )
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name,
         num_labels=len(ACTION_CLASSES),
         id2label=ID2LABEL,
         label2id=LABEL2ID,
+        local_files_only=args.local_files_only,
+        trust_remote_code=args.trust_remote_code,
         attn_implementation="eager",
     )
+
+    target_modules = infer_lora_targets(model, args.target_modules)
+    print(f"lora_target_modules={target_modules}")
+    lora_config = LoraConfig(
+        task_type=TaskType.SEQ_CLS,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=target_modules,
+        modules_to_save=split_csv(args.modules_to_save),
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
     model.to(device)
 
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
@@ -170,6 +213,8 @@ def main():
         num_training_steps=total_steps,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=args.fp16 and device.type == "cuda")
+    use_amp = (args.fp16 or args.bf16) and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
 
     best_f1 = -1.0
     os.makedirs(args.output_dir, exist_ok=True)
@@ -182,7 +227,7 @@ def main():
         for step, batch in enumerate(train_loader, start=1):
             labels = batch.pop("labels").to(device)
             batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.amp.autocast("cuda", enabled=args.fp16 and device.type == "cuda"):
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 logits = model(**batch).logits
                 loss = criterion(logits, labels) / args.grad_accum
             scaler.scale(loss).backward()
@@ -202,7 +247,7 @@ def main():
                         f"loss={running_loss / step:.4f}"
                     )
 
-        macro_f1 = evaluate(model, val_loader, device, args.fp16)
+        macro_f1 = evaluate(model, val_loader, device, use_amp)
         print(f"epoch={epoch} val_macro_f1={macro_f1:.5f}")
         if macro_f1 > best_f1:
             best_f1 = macro_f1
@@ -218,23 +263,17 @@ def main():
                         "max_length": args.max_length,
                         "max_history_events": args.max_history_events,
                         "action_classes": ACTION_CLASSES,
+                        "lora_r": args.lora_r,
+                        "lora_alpha": args.lora_alpha,
+                        "lora_dropout": args.lora_dropout,
+                        "target_modules": target_modules,
                     },
                     f,
                     ensure_ascii=False,
                     indent=2,
                 )
-            print(f"saved best model to {args.output_dir}")
-
-    if args.save_fp16 and device.type == "cuda":
-        print("converting saved best model to fp16")
-        best_model = AutoModelForSequenceClassification.from_pretrained(
-            args.output_dir,
-            attn_implementation="eager",
-        )
-        best_model.half()
-        best_model.save_pretrained(args.output_dir)
+            print(f"saved best LoRA adapter to {args.output_dir}")
 
 
 if __name__ == "__main__":
     main()
-

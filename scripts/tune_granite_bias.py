@@ -51,7 +51,11 @@ def predict_logits(model_dir, texts, max_length, batch_size):
     from transformers import AutoModelForSequenceClassification, AutoTokenizer, DataCollatorWithPadding
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
-    model = AutoModelForSequenceClassification.from_pretrained(model_dir, local_files_only=True)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_dir,
+        local_files_only=True,
+        attn_implementation="eager",
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()

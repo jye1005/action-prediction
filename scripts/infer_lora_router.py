@@ -36,27 +36,48 @@ def load_logit_bias(model_dir, id2label):
         return None
     with open(path, encoding="utf-8") as f:
         payload = json.load(f)
-    values = []
     bias_map = payload.get("bias", {})
-    for idx in range(len(id2label)):
-        values.append(float(bias_map.get(id2label[idx], 0.0)))
-    return values
+    return [float(bias_map.get(id2label[idx], 0.0)) for idx in range(len(id2label))]
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default="./data")
-    parser.add_argument("--model-dir", default="./model/granite-311m-fold0")
-    parser.add_argument("--output-path", default="./output/submission.csv")
+    parser.add_argument("--model-dir", default="./model/granite-lora-router")
+    parser.add_argument("--base-model", default="")
+    parser.add_argument("--output-path", default="./output/submission_lora.csv")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--max-history-events", type=int, default=12)
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
 
     import torch
+    from peft import PeftModel
     from torch.utils.data import DataLoader
     from transformers import AutoModelForSequenceClassification, AutoTokenizer, DataCollatorWithPadding
+
+    model_dir = Path(args.model_dir)
+    if args.base_model:
+        base_model_name = args.base_model
+    else:
+        with open(model_dir / "training_meta.json", encoding="utf-8") as f:
+            base_model_name = json.load(f)["base_model"]
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=args.local_files_only)
+    base_model = AutoModelForSequenceClassification.from_pretrained(
+        base_model_name,
+        local_files_only=args.local_files_only,
+        trust_remote_code=args.trust_remote_code,
+        attn_implementation="eager",
+    )
+    model = PeftModel.from_pretrained(base_model, model_dir, local_files_only=args.local_files_only)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    bias_values = load_logit_bias(model_dir, model.config.id2label)
+    bias = torch.tensor(bias_values, dtype=torch.float32, device=device) if bias_values is not None else None
 
     class TextDataset:
         def __init__(self, texts, tokenizer, max_length):
@@ -75,24 +96,9 @@ def main():
                 padding=False,
             )
 
-    model_dir = Path(args.model_dir)
-    model_name_or_path = str(model_dir) if model_dir.exists() else args.model_dir
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, local_files_only=args.local_files_only)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name_or_path,
-        local_files_only=args.local_files_only,
-        attn_implementation="eager",
-    )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model.eval()
-    bias_values = load_logit_bias(model_dir, model.config.id2label)
-    bias = torch.tensor(bias_values, dtype=torch.float32, device=device) if bias_values is not None else None
-
     samples = load_jsonl(Path(args.data_dir) / "test.jsonl")
     ids = [sample["id"] for sample in samples]
     texts = [render_granite_sample(sample, max_history_events=args.max_history_events) for sample in samples]
-
     loader = DataLoader(
         TextDataset(texts, tokenizer, args.max_length),
         batch_size=args.batch_size,
@@ -104,8 +110,7 @@ def main():
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                logits = model(**batch).logits
+            logits = model(**batch).logits
             if bias is not None:
                 logits = logits.float() + bias
             pred_ids = torch.argmax(logits, dim=-1).cpu().numpy().tolist()
