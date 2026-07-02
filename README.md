@@ -2,6 +2,10 @@
 
 AI 코딩 에이전트 세션 상태에서 다음 행동(action)을 14개 클래스 중 하나로 예측하는 대회용 작업 저장소다.
 
+## Experiments
+
+시도한 모델과 성능 기록은 `docs/experiments.md`에 정리한다.
+
 ## Baseline
 
 현재 코드는 배포 baseline notebook을 Python script로 변환한 초기 버전이다.
