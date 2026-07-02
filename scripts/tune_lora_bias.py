@@ -17,7 +17,7 @@ from action_router.features import render_granite_sample, session_group
 
 def load_jsonl(path):
     with open(path, encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()
+        return [json.loads(line) for line in f if line.strip()]
 
 
 def load_labels(path):
