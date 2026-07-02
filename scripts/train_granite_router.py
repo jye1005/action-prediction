@@ -108,8 +108,8 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.06)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--fp16", action="store_true", default=True)
-    parser.add_argument("--save-fp16", action="store_true", default=True)
+    parser.add_argument("--fp16", action="store_true", default=False)
+    parser.add_argument("--save-fp16", action="store_true", default=False)
     args = parser.parse_args()
 
     import torch
@@ -195,7 +195,7 @@ def main():
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 update_step += 1
-                if update_step % 50 == 0:
+                if update_step % 10 == 0:
                     print(
                         f"epoch={epoch} update={update_step}/{update_steps_per_epoch} "
                         f"loss={running_loss / step:.4f}"
