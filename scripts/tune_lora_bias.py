@@ -9,7 +9,7 @@ from sklearn.metrics import classification_report, f1_score
 from sklearn.model_selection import GroupKFold
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT_DIR / "src")
+sys.path.insert(0, str(ROOT_DIR / "src"))
 
 from action_router.constants import ACTION_CLASSES, ID2LABEL, LABEL2ID
 from action_router.features import render_granite_sample, session_group
