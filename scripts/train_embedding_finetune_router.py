@@ -9,13 +9,13 @@ from pathlib import Path
 
 import numpy as np
 from sklearn.metrics import f1_score
-from sklearn.model_selection import GroupKFold, train_test_split
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "src"))
 
 from action_router.constants import ACTION_CLASSES, ID2LABEL, LABEL2ID
 from action_router.features import render_sample, session_group
+from action_router.split import split_train_val
 
 
 class ActionDataset:
@@ -74,20 +74,6 @@ def class_weights(y):
     return weights / weights.mean()
 
 
-def split_train_val(texts, y, groups, args):
-    if args.split_mode == "group":
-        splits = list(GroupKFold(n_splits=args.n_splits).split(texts, y, groups))
-        train_idx, val_idx = splits[args.fold]
-        return texts[train_idx].tolist(), texts[val_idx].tolist(), y[train_idx], y[val_idx]
-    train_texts, val_texts, y_train, y_val = train_test_split(
-        texts.tolist(),
-        y,
-        test_size=args.val_size,
-        stratify=y,
-        random_state=args.seed,
-    )
-    return train_texts, val_texts, y_train, y_val
-
 
 def evaluate(model, loader, device, use_amp, amp_dtype):
     import torch
@@ -128,7 +114,7 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.06)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--split-mode", choices=["group", "stratified"], default="group")
+    parser.add_argument("--split-mode", choices=["group", "stratified", "all"], default="group")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--val-size", type=float, default=0.2)
@@ -152,8 +138,16 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     texts, y, groups = build_data(args.data_dir, args.max_history)
-    train_texts, val_texts, y_train, y_val = split_train_val(texts, y, groups, args)
-    print(f"train={len(train_texts)} val={len(val_texts)} model={args.model_name} split={args.split_mode}")
+    train_texts, val_texts, y_train, y_val, has_val, _, _ = split_train_val(
+        texts, y, groups, args.split_mode, args.fold, args.n_splits, args.val_size, args.seed
+    )
+    if has_val:
+        print(
+            f"train={len(train_texts)} val={len(val_texts)} model={args.model_name} "
+            f"split={args.split_mode} fold={args.fold}/{args.n_splits}"
+        )
+    else:
+        print(f"train={len(train_texts)} val=0 model={args.model_name} split=all")
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name,
@@ -183,13 +177,15 @@ def main():
         collate_fn=collator,
         num_workers=2,
     )
-    val_loader = DataLoader(
-        ActionDataset(val_texts, y_val, tokenizer, args.max_length),
-        batch_size=args.eval_batch_size,
-        shuffle=False,
-        collate_fn=collator,
-        num_workers=2,
-    )
+    val_loader = None
+    if has_val:
+        val_loader = DataLoader(
+            ActionDataset(val_texts, y_val, tokenizer, args.max_length),
+            batch_size=args.eval_batch_size,
+            shuffle=False,
+            collate_fn=collator,
+            num_workers=2,
+        )
 
     weights = torch.tensor(class_weights(y_train), dtype=torch.float32, device=device)
     criterion = torch.nn.CrossEntropyLoss(weight=weights)
@@ -236,27 +232,39 @@ def main():
                         f"loss={running_loss / step:.4f}"
                     )
 
-        macro_f1 = evaluate(model, val_loader, device, use_amp, amp_dtype)
-        print(f"epoch={epoch} val_macro_f1={macro_f1:.5f}")
-        if macro_f1 > best_f1:
-            best_f1 = macro_f1
+        train_loss = running_loss / len(train_loader)
+        should_save = False
+        if has_val:
+            macro_f1 = evaluate(model, val_loader, device, use_amp, amp_dtype)
+            print(f"epoch={epoch} val_macro_f1={macro_f1:.5f}")
+            if macro_f1 > best_f1:
+                best_f1 = macro_f1
+                should_save = True
+        else:
+            print(f"epoch={epoch} train_loss={train_loss:.4f}")
+            should_save = True
+
+        if should_save:
             model.save_pretrained(args.output_dir)
             tokenizer.save_pretrained(args.output_dir)
+            meta = {
+                "base_model": args.model_name,
+                "split_mode": args.split_mode,
+                "max_length": args.max_length,
+                "max_history": args.max_history,
+                "action_classes": ACTION_CLASSES,
+            }
+            if has_val:
+                meta["best_val_macro_f1"] = best_f1
+                meta["fold"] = args.fold
+                meta["n_splits"] = args.n_splits
+            else:
+                meta["epochs"] = args.epochs
+                meta["final_epoch"] = epoch
+                meta["final_train_loss"] = train_loss
             with open(Path(args.output_dir) / "training_meta.json", "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "base_model": args.model_name,
-                        "best_val_macro_f1": best_f1,
-                        "max_length": args.max_length,
-                        "max_history": args.max_history,
-                        "split_mode": args.split_mode,
-                        "action_classes": ACTION_CLASSES,
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            print(f"saved best model to {args.output_dir}")
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            print(f"saved model to {args.output_dir}")
 
 
 if __name__ == "__main__":

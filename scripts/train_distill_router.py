@@ -9,13 +9,13 @@ from pathlib import Path
 
 import numpy as np
 from sklearn.metrics import f1_score
-from sklearn.model_selection import GroupKFold
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "src"))
 
 from action_router.constants import ACTION_CLASSES, ID2LABEL, LABEL2ID
 from action_router.features import render_granite_sample, session_group
+from action_router.split import split_train_val
 
 
 class DistillDataset:
@@ -145,8 +145,10 @@ def main():
     parser.add_argument("--teacher-logits", required=True)
     parser.add_argument("--model-name", default="intfloat/multilingual-e5-small")
     parser.add_argument("--output-dir", default="./model/distill-router")
+    parser.add_argument("--split-mode", choices=["group", "stratified", "all"], default="group")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--n-splits", type=int, default=5)
+    parser.add_argument("--val-size", type=float, default=0.2)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--max-history-events", type=int, default=12)
     parser.add_argument("--epochs", type=int, default=3)
@@ -182,10 +184,13 @@ def main():
     ids, texts, y, groups = build_data(args.data_dir, args.max_history_events)
     teacher_logits = load_teacher_logits(args.teacher_logits, ids)
 
-    splitter = GroupKFold(n_splits=args.n_splits)
-    splits = list(splitter.split(texts, y, groups))
-    train_idx, val_idx = splits[args.fold]
-    print(f"train={len(train_idx)} val={len(val_idx)} fold={args.fold}/{args.n_splits}")
+    train_texts, val_texts, y_train, y_val, has_val, train_idx, val_idx = split_train_val(
+        texts, y, groups, args.split_mode, args.fold, args.n_splits, args.val_size, args.seed
+    )
+    if has_val:
+        print(f"train={len(train_texts)} val={len(val_texts)} split={args.split_mode} fold={args.fold}/{args.n_splits}")
+    else:
+        print(f"train={len(train_texts)} val=0 split=all")
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name,
@@ -210,8 +215,8 @@ def main():
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
     train_loader = DataLoader(
         DistillDataset(
-            texts[train_idx].tolist(),
-            y[train_idx],
+            train_texts,
+            y_train,
             teacher_logits[train_idx],
             tokenizer,
             args.max_length,
@@ -221,15 +226,17 @@ def main():
         collate_fn=collator,
         num_workers=2,
     )
-    val_loader = DataLoader(
-        EvalDataset(texts[val_idx].tolist(), y[val_idx], tokenizer, args.max_length),
-        batch_size=args.eval_batch_size,
-        shuffle=False,
-        collate_fn=collator,
-        num_workers=2,
-    )
+    val_loader = None
+    if has_val:
+        val_loader = DataLoader(
+            EvalDataset(val_texts, y_val, tokenizer, args.max_length),
+            batch_size=args.eval_batch_size,
+            shuffle=False,
+            collate_fn=collator,
+            num_workers=2,
+        )
 
-    weights = torch.tensor(class_weights(y[train_idx]), dtype=torch.float32, device=device)
+    weights = torch.tensor(class_weights(y_train), dtype=torch.float32, device=device)
     criterion = torch.nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     update_steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
@@ -284,31 +291,42 @@ def main():
                         f"loss={running_loss / step:.4f}"
                     )
 
-        macro_f1 = evaluate(model, val_loader, device, use_amp, amp_dtype)
-        print(f"epoch={epoch} val_macro_f1={macro_f1:.5f}")
-        if macro_f1 > best_f1:
-            best_f1 = macro_f1
+        train_loss = running_loss / len(train_loader)
+        should_save = False
+        if has_val:
+            macro_f1 = evaluate(model, val_loader, device, use_amp, amp_dtype)
+            print(f"epoch={epoch} val_macro_f1={macro_f1:.5f}")
+            if macro_f1 > best_f1:
+                best_f1 = macro_f1
+                should_save = True
+        else:
+            print(f"epoch={epoch} train_loss={train_loss:.4f}")
+            should_save = True
+
+        if should_save:
             model.save_pretrained(args.output_dir)
             tokenizer.save_pretrained(args.output_dir)
+            meta = {
+                "base_model": args.model_name,
+                "teacher_logits": args.teacher_logits,
+                "split_mode": args.split_mode,
+                "max_length": args.max_length,
+                "max_history_events": args.max_history_events,
+                "temperature": args.temperature,
+                "hard_loss_weight": args.hard_loss_weight,
+                "action_classes": ACTION_CLASSES,
+            }
+            if has_val:
+                meta["best_val_macro_f1"] = best_f1
+                meta["fold"] = args.fold
+                meta["n_splits"] = args.n_splits
+            else:
+                meta["epochs"] = args.epochs
+                meta["final_epoch"] = epoch
+                meta["final_train_loss"] = train_loss
             with open(Path(args.output_dir) / "training_meta.json", "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "base_model": args.model_name,
-                        "teacher_logits": args.teacher_logits,
-                        "best_val_macro_f1": best_f1,
-                        "fold": args.fold,
-                        "n_splits": args.n_splits,
-                        "max_length": args.max_length,
-                        "max_history_events": args.max_history_events,
-                        "temperature": args.temperature,
-                        "hard_loss_weight": args.hard_loss_weight,
-                        "action_classes": ACTION_CLASSES,
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            print(f"saved best distill model to {args.output_dir}")
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            print(f"saved distill model to {args.output_dir}")
 
 
 if __name__ == "__main__":
