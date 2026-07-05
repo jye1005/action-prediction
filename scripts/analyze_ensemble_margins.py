@@ -70,6 +70,12 @@ def main():
     parser.add_argument("--max-history", type=int, default=8)
     parser.add_argument("--max-history-events", type=int, default=12)
     parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument(
+        "--fold",
+        type=int,
+        default=0,
+        help="When --model-dirs has one entry, score only this fold's validation split.",
+    )
     parser.add_argument("--use-logit-bias", action="store_true", default=True)
     parser.add_argument("--no-logit-bias", dest="use_logit_bias", action="store_false")
     parser.add_argument("--local-files-only", action="store_true")
@@ -78,8 +84,9 @@ def main():
     args = parser.parse_args()
 
     model_dirs = split_csv(args.model_dirs)
-    if len(model_dirs) != args.folds:
-        raise ValueError("--model-dirs must contain one model per fold.")
+    single_fold_mode = len(model_dirs) == 1
+    if not single_fold_mode and len(model_dirs) != args.folds:
+        raise ValueError("--model-dirs must contain one model per fold, or exactly one model with --fold.")
 
     samples = load_jsonl(Path(args.data_dir) / "train.jsonl")
     labels = load_labels(Path(args.data_dir) / "train_labels.csv")
@@ -89,25 +96,40 @@ def main():
     texts = np.asarray(render_texts(samples, args.feature_mode, args.max_history, args.max_history_events), dtype=object)
 
     splits = list(GroupKFold(n_splits=args.folds).split(texts, y, groups))
-    logits = np.zeros((len(texts), len(ACTION_CLASSES)), dtype=np.float32)
-    for fold, (_, val_idx) in enumerate(splits):
-        print(f"predict oof fold={fold} model={model_dirs[fold]} rows={len(val_idx)}", flush=True)
-        logits[val_idx], _ = predict_logits_for_model(model_dirs[fold], texts[val_idx].tolist(), args)
+    if single_fold_mode:
+        if args.fold < 0 or args.fold >= args.folds:
+            raise ValueError(f"--fold must be in [0, {args.folds - 1}]")
+        _, val_idx = splits[args.fold]
+        print(
+            f"predict single-fold fold={args.fold} model={model_dirs[0]} rows={len(val_idx)}",
+            flush=True,
+        )
+        fold_logits, _ = predict_logits_for_model(model_dirs[0], texts[val_idx].tolist(), args)
+        y_eval = y[val_idx]
+        logits_eval = fold_logits
+    else:
+        logits = np.zeros((len(texts), len(ACTION_CLASSES)), dtype=np.float32)
+        for fold, (_, val_idx) in enumerate(splits):
+            print(f"predict oof fold={fold} model={model_dirs[fold]} rows={len(val_idx)}", flush=True)
+            logits[val_idx], _ = predict_logits_for_model(model_dirs[fold], texts[val_idx].tolist(), args)
+        y_eval = y
+        logits_eval = logits
 
-    probs = softmax(logits)
-    order = np.argsort(-logits, axis=1)
+    probs = softmax(logits_eval)
+    order = np.argsort(-logits_eval, axis=1)
     top1 = order[:, 0]
     top2 = order[:, 1]
     pred = top1
-    correct = pred == y
-    margin = logits[np.arange(len(logits)), top1] - logits[np.arange(len(logits)), top2]
+    correct = pred == y_eval
+    margin = logits_eval[np.arange(len(logits_eval)), top1] - logits_eval[np.arange(len(logits_eval)), top2]
     confidence = probs[np.arange(len(probs)), top1]
     top1_labels = np.asarray(ACTION_CLASSES, dtype=object)[top1]
 
-    macro_f1 = f1_score(y, pred, labels=list(range(len(ACTION_CLASSES))), average="macro", zero_division=0)
-    print(f"\noof_macro_f1={macro_f1:.6f}")
+    macro_f1 = f1_score(y_eval, pred, labels=list(range(len(ACTION_CLASSES))), average="macro", zero_division=0)
+    score_label = "val_macro_f1" if single_fold_mode else "oof_macro_f1"
+    print(f"\n{score_label}={macro_f1:.6f}")
     print(f"accuracy={float(correct.mean()):.6f}")
-    print(classification_report(y, pred, target_names=ACTION_CLASSES, digits=4, zero_division=0))
+    print(classification_report(y_eval, pred, target_names=ACTION_CLASSES, digits=4, zero_division=0))
 
     print("\n[overall margin/confidence]")
     for name, values in [("margin", margin), ("confidence", confidence)]:
