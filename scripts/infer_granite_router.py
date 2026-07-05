@@ -9,6 +9,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "src"))
 
 from action_router.features import render_granite_text
+from action_router.constants import ACTION_CLASSES
 
 
 def load_jsonl(path):
@@ -48,6 +49,12 @@ def main():
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--model-dir", default="./model/granite-311m-fold0")
     parser.add_argument("--output-path", default="./output/submission.csv")
+    parser.add_argument(
+        "--probs-path",
+        default=None,
+        help="Optional .npz path to save per-class logits and probabilities "
+        "(columns ordered by ACTION_CLASSES) for ensembling/stacking.",
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--max-history-events", type=int, default=12)
@@ -113,16 +120,22 @@ def main():
         collate_fn=DataCollatorWithPadding(tokenizer=tokenizer),
     )
 
+    import numpy as np
+
     preds = []
+    logit_chunks = []
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 logits = model(**batch).logits
+            logits = logits.float()
             if bias is not None:
-                logits = logits.float() + bias
+                logits = logits + bias
             pred_ids = torch.argmax(logits, dim=-1).cpu().numpy().tolist()
             preds.extend([model.config.id2label[int(i)] for i in pred_ids])
+            if args.probs_path:
+                logit_chunks.append(logits.cpu().numpy())
 
     pred_map = dict(zip(ids, preds))
     fieldnames, rows = load_sample_submission(Path(args.data_dir) / "sample_submission.csv")
@@ -130,6 +143,30 @@ def main():
         row["action"] = pred_map[row["id"]]
     save_submission(args.output_path, fieldnames, rows)
     print(f"Saved {args.output_path} rows={len(rows)}")
+
+    if args.probs_path:
+        # Logits are in the model's own id order; reorder to canonical
+        # ACTION_CLASSES so every model's columns line up for ensembling.
+        all_logits = np.concatenate(logit_chunks, axis=0)
+        label2id = {model.config.id2label[i]: i for i in range(all_logits.shape[1])}
+        missing = [c for c in ACTION_CLASSES if c not in label2id]
+        if missing:
+            raise ValueError(f"model is missing action classes: {missing}")
+        col_order = [label2id[name] for name in ACTION_CLASSES]
+        ordered = all_logits[:, col_order].astype(np.float32)
+        shifted = ordered - ordered.max(axis=1, keepdims=True)
+        exp = np.exp(shifted)
+        probs = (exp / exp.sum(axis=1, keepdims=True)).astype(np.float32)
+        out = Path(args.probs_path)
+        os.makedirs(out.parent, exist_ok=True)
+        np.savez(
+            out,
+            ids=np.array(ids),
+            classes=np.array(ACTION_CLASSES),
+            logits=ordered,
+            probs=probs,
+        )
+        print(f"Saved probs to {args.probs_path} shape={probs.shape} (post-bias, ACTION_CLASSES order)")
 
 
 if __name__ == "__main__":

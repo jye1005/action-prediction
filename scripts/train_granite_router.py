@@ -51,15 +51,22 @@ def load_labels(path):
 def build_data(data_dir, max_history_events, feature_mode):
     samples = load_jsonl(Path(data_dir) / "train.jsonl")
     labels = load_labels(Path(data_dir) / "train_labels.csv")
+    ids = []
     texts = []
     y = []
     groups = []
     for sample in samples:
         sample_id = sample["id"]
+        ids.append(sample_id)
         texts.append(render_granite_text(sample, max_history_events=max_history_events, feature_mode=feature_mode))
         y.append(LABEL2ID[labels[sample_id]])
         groups.append(session_group(sample_id))
-    return np.array(texts, dtype=object), np.array(y, dtype=np.int64), np.array(groups, dtype=object)
+    return (
+        np.array(ids, dtype=object),
+        np.array(texts, dtype=object),
+        np.array(y, dtype=np.int64),
+        np.array(groups, dtype=object),
+    )
 
 
 def class_weights(y):
@@ -73,21 +80,28 @@ def class_weights(y):
     return weights / weights.mean()
 
 
-def evaluate(model, loader, device, use_fp16):
+def evaluate(model, loader, device, use_fp16, return_logits=False):
     import torch
 
     model.eval()
     preds = []
     gold = []
+    logit_chunks = []
     with torch.no_grad():
         for batch in loader:
             labels = batch.pop("labels").numpy().tolist()
             batch = {k: v.to(device) for k, v in batch.items()}
             with torch.amp.autocast("cuda", enabled=use_fp16 and device.type == "cuda"):
                 logits = model(**batch).logits
+            logits = logits.float()
             preds.extend(torch.argmax(logits, dim=-1).cpu().numpy().tolist())
             gold.extend(labels)
-    return f1_score(gold, preds, labels=list(range(len(ACTION_CLASSES))), average="macro", zero_division=0)
+            if return_logits:
+                logit_chunks.append(logits.cpu().numpy())
+    macro_f1 = f1_score(gold, preds, labels=list(range(len(ACTION_CLASSES))), average="macro", zero_division=0)
+    if return_logits:
+        return macro_f1, np.concatenate(logit_chunks, axis=0), np.array(gold, dtype=np.int64)
+    return macro_f1
 
 
 def main():
@@ -95,6 +109,12 @@ def main():
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--model-name", default="ibm-granite/granite-embedding-311m-multilingual-r2")
     parser.add_argument("--output-dir", default="./model/granite-311m-fold0")
+    parser.add_argument(
+        "--oof-path",
+        default=None,
+        help="Optional .npz path to save best-epoch validation OOF (ids, y_true, "
+        "logits, probs in ACTION_CLASSES order) for learning ensemble/stacking weights.",
+    )
     parser.add_argument("--split-mode", choices=["group", "stratified", "all"], default="group")
     parser.add_argument("--feature-mode", choices=["granite", "granite_v2", "granite_v3"], default="granite")
     parser.add_argument("--fold", type=int, default=0)
@@ -126,11 +146,12 @@ def main():
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    texts, y, groups = build_data(args.data_dir, args.max_history_events, args.feature_mode)
+    ids, texts, y, groups = build_data(args.data_dir, args.max_history_events, args.feature_mode)
 
-    train_texts, val_texts, y_train, y_val, has_val, _, _ = split_train_val(
+    train_texts, val_texts, y_train, y_val, has_val, _, val_idx = split_train_val(
         texts, y, groups, args.split_mode, args.fold, args.n_splits, args.val_size, args.seed
     )
+    val_ids = ids[val_idx] if has_val else np.array([], dtype=object)
     if has_val:
         print(f"train={len(train_texts)} val={len(val_texts)} split={args.split_mode} fold={args.fold}/{args.n_splits}")
     else:
@@ -209,8 +230,11 @@ def main():
 
         train_loss = running_loss / len(train_loader)
         should_save = False
+        val_logits = None
         if has_val:
-            macro_f1 = evaluate(model, val_loader, device, args.fp16)
+            macro_f1, val_logits, val_gold = evaluate(
+                model, val_loader, device, args.fp16, return_logits=True
+            )
             print(f"epoch={epoch} val_macro_f1={macro_f1:.5f}")
             if macro_f1 > best_f1:
                 best_f1 = macro_f1
@@ -241,6 +265,27 @@ def main():
             with open(Path(args.output_dir) / "training_meta.json", "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
             print(f"saved model to {args.output_dir}")
+
+            if has_val and args.oof_path and val_logits is not None:
+                # model id order == ID2LABEL == ACTION_CLASSES, but reorder
+                # defensively so OOF columns always line up across models.
+                label2id = {model.config.id2label[i]: i for i in range(val_logits.shape[1])}
+                col_order = [label2id[name] for name in ACTION_CLASSES]
+                ordered = val_logits[:, col_order].astype(np.float32)
+                shifted = ordered - ordered.max(axis=1, keepdims=True)
+                exp = np.exp(shifted)
+                probs = (exp / exp.sum(axis=1, keepdims=True)).astype(np.float32)
+                oof_out = Path(args.oof_path)
+                os.makedirs(oof_out.parent, exist_ok=True)
+                np.savez(
+                    oof_out,
+                    ids=np.array(val_ids),
+                    y_true=np.asarray(val_gold, dtype=np.int64),
+                    classes=np.array(ACTION_CLASSES),
+                    logits=ordered,
+                    probs=probs,
+                )
+                print(f"saved OOF to {args.oof_path} shape={probs.shape} (best epoch={epoch})")
 
     if args.save_fp16 and device.type == "cuda":
         print("converting saved best model to fp16")
