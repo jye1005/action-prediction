@@ -23,11 +23,14 @@ import os
 from pathlib import Path
 
 # ---- edit this to match the checkpoint folder name inside the zip ----
-MODEL_DIR = "./model/granite-311m-v2-fold0-1"
-MAX_LENGTH = 512
+MODEL_DIR = os.environ.get("MODEL_DIR", "./model/granite-311m-v2-fold0-1")
+MAX_LENGTH = int(os.environ.get("MAX_LENGTH", "512"))
 MAX_HISTORY_EVENTS = 12
 MAX_OPEN_FILES = 8
-BATCH_SIZE = 64
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "256"))
+# T4 has no bf16 tensor cores (slow); fp16 NaNs on ModernBert. sdpa >> eager for speed.
+ATTN = os.environ.get("ATTN", "sdpa")
+DTYPE = os.environ.get("DTYPE", "bf16")  # bf16 | fp32
 
 
 # ======================= embedded granite_v2 renderer =======================
@@ -206,6 +209,7 @@ def main():
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
+    import time
     import torch
     from torch.utils.data import DataLoader
     from transformers import AutoModelForSequenceClassification, AutoTokenizer, DataCollatorWithPadding
@@ -214,15 +218,18 @@ def main():
     data_dir = Path(os.environ.get("DATA_DIR", "./data"))
     model_dir = Path(MODEL_DIR)
     output_path = Path("./output/submission.csv")
+    torch_dtype = torch.float32 if DTYPE == "fp32" else torch.bfloat16
+    print(f"attn={ATTN} dtype={DTYPE} batch={BATCH_SIZE} max_len={MAX_LENGTH}", flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
-    # bf16 + eager: stable ModernBert inference (fp16 -> NaN). Upcasts the
-    # fp16-on-disk weights to bf16 for compute.
+    # NOTE: never fp16 -> ModernBert overflows to NaN. bf16 (or fp32) only.
+    # sdpa >> eager for speed; bf16 is slow on T4 (no bf16 tensor cores) so fp32
+    # may actually be faster there -- try DTYPE=fp32 if bf16 is the bottleneck.
     model = AutoModelForSequenceClassification.from_pretrained(
         model_dir,
         local_files_only=True,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="eager",
+        torch_dtype=torch_dtype,
+        attn_implementation=ATTN,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -250,6 +257,7 @@ def main():
     )
 
     preds = []
+    t0 = time.time()
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -258,6 +266,7 @@ def main():
                 logits = logits + bias
             pred_ids = torch.argmax(logits, dim=-1).cpu().numpy().tolist()
             preds.extend([model.config.id2label[int(i)] for i in pred_ids])
+    print(f"inference: {len(preds)} rows in {time.time() - t0:.1f}s", flush=True)
 
     pred_map = dict(zip(ids, preds))
     fieldnames, rows = load_sample_submission(data_dir / "sample_submission.csv")
