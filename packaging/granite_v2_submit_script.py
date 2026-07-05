@@ -210,7 +210,8 @@ def main():
     from torch.utils.data import DataLoader
     from transformers import AutoModelForSequenceClassification, AutoTokenizer, DataCollatorWithPadding
 
-    data_dir = Path("./data")
+    # Submission: server provides ./data. Local test: set DATA_DIR=../data.
+    data_dir = Path(os.environ.get("DATA_DIR", "./data"))
     model_dir = Path(MODEL_DIR)
     output_path = Path("./output/submission.csv")
 
