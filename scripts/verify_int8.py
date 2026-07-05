@@ -118,7 +118,16 @@ def load_logit_bias(model_dir, id2label):
     return [float(bias_map.get(id2label[idx], 0.0)) for idx in range(len(id2label))]
 
 
-def run_inference(model, tokenizer, texts, device, max_length, batch_size, bias, fp16):
+DTYPE_MAP = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}
+
+
+def run_inference(model, tokenizer, texts, device, max_length, batch_size, bias):
+    """Run in the model's own dtype (no autocast).
+
+    autocast forces fp16, which makes ModernBert (granite-embedding) overflow to
+    NaN. Loading the model in bf16/fp32 and running WITHOUT autocast avoids the
+    dtype mismatch entirely.
+    """
     import torch
     from torch.utils.data import DataLoader
     from transformers import DataCollatorWithPadding
@@ -141,10 +150,7 @@ def run_inference(model, tokenizer, texts, device, max_length, batch_size, bias,
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            use_amp = fp16 and device.type == "cuda"
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                logits = model(**batch).logits
-            logits = logits.float()
+            logits = model(**batch).logits.float()
             if bias is not None:
                 logits = logits + bias
             all_logits.append(logits.cpu().numpy())
@@ -168,12 +174,22 @@ def main():
     parser.add_argument("--out-npz", default=None)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--dtype", choices=list(DTYPE_MAP), default="bf16",
+                        help="Inference dtype for non-int8 parts. Use bf16 for granite/ModernBert (fp16 -> NaN).")
+    parser.add_argument("--keep-head-fp", action="store_true", default=True,
+                        help="Keep the classification head out of int8 (bnb). On by default; encoder heads collapse if quantized.")
+    parser.add_argument("--quantize-head", dest="keep_head_fp", action="store_false",
+                        help="Force-quantize the head too (to reproduce the collapse).")
     parser.add_argument("--skip-fp", action="store_true",
                         help="Trust baseline npz as the fp reference instead of recomputing it.")
     args = parser.parse_args()
 
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    torch_dtype = getattr(torch, DTYPE_MAP[args.dtype])
+    # Module-name fragments bnb should NOT quantize (classification head + norms).
+    skip_modules = ["classifier", "score", "pre_classifier", "head"] if args.keep_head_fp else None
 
     renderer = RENDERERS[args.renderer]
     ids, texts, y_true, base_probs = build_eval_set(args.data_dir, args.baseline_npz, renderer)
@@ -188,13 +204,15 @@ def main():
 
     fp_macro = base_macro
     if not args.skip_fp:
-        model = AutoModelForSequenceClassification.from_pretrained(args.model_dir, local_files_only=True)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            args.model_dir, local_files_only=True, torch_dtype=torch_dtype
+        )
         model.to(device)
         bias_vals = load_logit_bias(args.model_dir, model.config.id2label)
         bias = torch.tensor(bias_vals, device=device) if bias_vals else None
-        fp_logits = run_inference(model, tokenizer, texts, device, args.max_length, args.batch_size, bias, fp16=True)
+        fp_logits = run_inference(model, tokenizer, texts, device, args.max_length, args.batch_size, bias)
         fp_macro = macro_f1(y_true, fp_logits.argmax(1))
-        print(f"[fp16 recompute] macro-F1 = {fp_macro:.4f}  (drift vs npz: {fp_macro - base_macro:+.4f})")
+        print(f"[{args.dtype} recompute] macro-F1 = {fp_macro:.4f}  (drift vs npz: {fp_macro - base_macro:+.4f})")
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -206,14 +224,16 @@ def main():
             from transformers import BitsAndBytesConfig
         except Exception as e:  # noqa: BLE001
             raise SystemExit(f"bitsandbytes/transformers BitsAndBytesConfig unavailable: {e}. Try --method dynamic.")
-        qconf = BitsAndBytesConfig(load_in_8bit=True)
+        qconf = BitsAndBytesConfig(load_in_8bit=True, llm_int8_skip_modules=skip_modules)
+        print(f"bnb 8bit  dtype={args.dtype}  skip_modules={skip_modules}")
         q_model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_dir, local_files_only=True, quantization_config=qconf, device_map="auto"
+            args.model_dir, local_files_only=True, quantization_config=qconf,
+            torch_dtype=torch_dtype, device_map="auto",
         )
         q_device = next(q_model.parameters()).device
         bias_vals = load_logit_bias(args.model_dir, q_model.config.id2label)
         bias = torch.tensor(bias_vals, device=q_device) if bias_vals else None
-        int8_logits = run_inference(q_model, tokenizer, texts, q_device, args.max_length, args.batch_size, bias, fp16=False)
+        int8_logits = run_inference(q_model, tokenizer, texts, q_device, args.max_length, args.batch_size, bias)
         int8_dir = Path(args.model_dir).parent / (Path(args.model_dir).name + "-int8")
         try:
             q_model.save_pretrained(int8_dir)
@@ -228,7 +248,7 @@ def main():
         q_model = torch.ao.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
         bias_vals = load_logit_bias(args.model_dir, model.config.id2label)
         bias = torch.tensor(bias_vals) if bias_vals else None
-        int8_logits = run_inference(q_model, tokenizer, texts, torch.device("cpu"), args.max_length, args.batch_size, bias, fp16=False)
+        int8_logits = run_inference(q_model, tokenizer, texts, torch.device("cpu"), args.max_length, args.batch_size, bias)
         int8_dir = Path(args.model_dir).parent / (Path(args.model_dir).name + "-int8-dynamic")
         int8_dir.mkdir(parents=True, exist_ok=True)
         torch.save(q_model.state_dict(), int8_dir / "int8_state.pt")
