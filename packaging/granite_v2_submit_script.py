@@ -31,6 +31,10 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "64"))
 # Proven-fast pattern (matches a passing submission): load default (fp32) + fp16
 # autocast + default sdpa attention. fp32 master weights => no NaN; fp16 compute
 # uses T4 tensor cores => fast. (bf16 is slow on T4; eager attn is slow.)
+# Benchmark knobs (defaults = fast; set to reproduce the slow combo):
+#   COMPUTE=bf16 ATTN=eager   -> the old timed-out configuration
+COMPUTE = os.environ.get("COMPUTE", "autocast")  # "autocast" (fp32+fp16) | "bf16"
+ATTN = os.environ.get("ATTN", "")                 # "" = default(sdpa); or "eager"
 
 
 # ======================= embedded granite_v2 renderer =======================
@@ -218,12 +222,16 @@ def main():
     data_dir = Path(os.environ.get("DATA_DIR", "./data"))
     model_dir = Path(MODEL_DIR)
     output_path = Path("./output/submission.csv")
-    print(f"batch={BATCH_SIZE} max_len={MAX_LENGTH} (fp32 load + fp16 autocast + default attn)", flush=True)
+    print(f"batch={BATCH_SIZE} max_len={MAX_LENGTH} compute={COMPUTE} attn={ATTN or 'default'}", flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
-    # default load = fp32 master weights; fp16 autocast in the loop keeps it stable
-    # AND fast on T4. Do NOT force torch_dtype=fp16 (pure fp16 can NaN on ModernBert).
-    model = AutoModelForSequenceClassification.from_pretrained(model_dir, local_files_only=True)
+    # default: fp32 master weights + fp16 autocast in the loop -> stable AND fast.
+    load_kwargs = {"local_files_only": True}
+    if ATTN:
+        load_kwargs["attn_implementation"] = ATTN
+    if COMPUTE == "bf16":
+        load_kwargs["torch_dtype"] = torch.bfloat16
+    model = AutoModelForSequenceClassification.from_pretrained(model_dir, **load_kwargs)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
@@ -250,11 +258,12 @@ def main():
     )
 
     preds = []
+    use_autocast = COMPUTE == "autocast"
     t0 = time.time()
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            with torch.amp.autocast("cuda", enabled=use_autocast and device.type == "cuda"):
                 logits = model(**batch).logits
             logits = logits.float()
             if bias is not None:
