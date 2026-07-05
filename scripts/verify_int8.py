@@ -137,7 +137,7 @@ def load_logit_bias(model_dir, id2label):
 DTYPE_MAP = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}
 
 
-def run_inference(model, tokenizer, texts, device, max_length, batch_size, bias, id2label):
+def run_inference(model, tokenizer, texts, device, max_length, batch_size, bias, id2label, autocast=False):
     """Run in the model's own dtype (no autocast) and return logits in
     ACTION_CLASSES column order.
 
@@ -170,7 +170,9 @@ def run_inference(model, tokenizer, texts, device, max_length, batch_size, bias,
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            logits = model(**batch).logits.float()
+            with torch.amp.autocast("cuda", enabled=autocast and device.type == "cuda"):
+                logits = model(**batch).logits
+            logits = logits.float()
             if bias is not None:  # bias is in model (id2label) order, applied pre-reorder
                 logits = logits + bias
             all_logits.append(logits.cpu().numpy())
@@ -211,6 +213,10 @@ def main():
                         help="Force-quantize the head too (to reproduce the collapse).")
     parser.add_argument("--attn-implementation", default="eager",
                         help="granite/ModernBert needs 'eager' (matches make_teacher_logits.py).")
+    parser.add_argument("--autocast", action="store_true",
+                        help="Wrap fp recompute in fp16 autocast (matches the fast submit script). "
+                             "Forces fp32 load. Use to measure the fast submission's real accuracy.")
+    parser.add_argument("--skip-int8", action="store_true", help="Only do the fp recompute; skip the int8 stage.")
     parser.add_argument("--skip-fp", action="store_true",
                         help="Trust baseline npz as the fp reference instead of recomputing it.")
     args = parser.parse_args()
@@ -257,20 +263,26 @@ def main():
 
     fp_macro = base_macro
     if not args.skip_fp:
+        # --autocast reproduces the fast submit (fp32 master + fp16 autocast).
+        fp_load_dtype = torch.float32 if args.autocast else torch_dtype
+        label = f"fp32+autocast(fp16)" if args.autocast else args.dtype
         model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_dir, local_files_only=True, torch_dtype=torch_dtype, **extra_kwargs
+            args.model_dir, local_files_only=True, torch_dtype=fp_load_dtype, **extra_kwargs
         )
         model.to(device)
         print(f"config.id2label = {dict(model.config.id2label)}")
         bias_vals = load_logit_bias(args.model_dir, model.config.id2label)
         bias = torch.tensor(bias_vals, device=device) if bias_vals else None
-        fp_logits = run_inference(model, tokenizer, texts, device, args.max_length, args.batch_size, bias, model.config.id2label)
+        fp_logits = run_inference(model, tokenizer, texts, device, args.max_length, args.batch_size, bias, model.config.id2label, autocast=args.autocast)
         fp_macro = macro_f1(y_true, fp_logits.argmax(1))
         pred = fp_logits.argmax(1)
         dist = {ACTION_CLASSES[c]: int((pred == c).sum()) for c in range(len(ACTION_CLASSES))}
         print(f"pred distribution: {dist}")
-        print(f"[{args.dtype} recompute] macro-F1 = {fp_macro:.4f}  (drift vs npz: {fp_macro - base_macro:+.4f})")
+        print(f"[{label} recompute] macro-F1 = {fp_macro:.4f}  (drift vs npz: {fp_macro - base_macro:+.4f})")
         del model
+        if args.skip_int8:
+            print("--skip-int8 set; done.")
+            return
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
