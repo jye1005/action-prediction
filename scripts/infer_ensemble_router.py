@@ -13,7 +13,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "src"))
 
 from action_router.constants import ACTION_CLASSES, LABEL2ID
-from action_router.features import render_granite_sample, render_sample
+from action_router.features import render_granite_text, render_sample
 
 
 def load_jsonl(path):
@@ -61,11 +61,32 @@ def load_logit_bias(model_dir, id2label):
     return np.asarray([float(bias_map.get(id2label[idx], 0.0)) for idx in range(len(id2label))], dtype=np.float32)
 
 
+def resolve_feature_mode(model_dirs, requested):
+    if requested != "auto":
+        return requested
+    modes = set()
+    for model_dir in model_dirs:
+        meta_path = Path(model_dir) / "training_meta.json"
+        if meta_path.exists():
+            with open(meta_path, encoding="utf-8") as f:
+                modes.add(json.load(f).get("feature_mode", "granite"))
+        else:
+            modes.add("granite")
+    if len(modes) != 1:
+        raise ValueError(
+            f"--feature-mode auto found mixed modes {sorted(modes)}; pass granite, granite_v2, or sample explicitly."
+        )
+    return modes.pop()
+
+
 def render_texts(samples, feature_mode, max_history, max_history_events):
     if feature_mode == "sample":
         return [render_sample(sample, max_history=max_history) for sample in samples]
-    if feature_mode == "granite":
-        return [render_granite_sample(sample, max_history_events=max_history_events) for sample in samples]
+    if feature_mode in {"granite", "granite_v2"}:
+        return [
+            render_granite_text(sample, max_history_events=max_history_events, feature_mode=feature_mode)
+            for sample in samples
+        ]
     raise ValueError(f"unknown feature_mode: {feature_mode}")
 
 
@@ -130,7 +151,7 @@ def main():
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--model-dirs", required=True, help="Comma-separated fold model dirs.")
     parser.add_argument("--output-path", default="./output/submission_ensemble.csv")
-    parser.add_argument("--feature-mode", choices=["granite", "sample"], default="granite")
+    parser.add_argument("--feature-mode", choices=["granite", "granite_v2", "sample", "auto"], default="auto")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--max-history", type=int, default=8)
@@ -153,6 +174,8 @@ def main():
     model_dirs = split_csv(args.model_dirs)
     if not model_dirs:
         raise ValueError("--model-dirs must contain at least one directory.")
+    feature_mode = resolve_feature_mode(model_dirs, args.feature_mode)
+    print(f"feature_mode={feature_mode}")
 
     if args.weights:
         weights = np.asarray([float(value) for value in split_csv(args.weights)], dtype=np.float32)
@@ -167,7 +190,7 @@ def main():
         labels = load_labels(Path(args.data_dir) / "train_labels.csv")
         ids = [sample["id"] for sample in samples]
         y = np.asarray([LABEL2ID[labels[sample_id]] for sample_id in ids], dtype=np.int64)
-        texts = np.asarray(render_texts(samples, args.feature_mode, args.max_history, args.max_history_events), dtype=object)
+        texts = np.asarray(render_texts(samples, feature_mode, args.max_history, args.max_history_events), dtype=object)
 
         if args.score_oof:
             if len(model_dirs) != args.folds:
@@ -206,7 +229,7 @@ def main():
 
     samples = load_jsonl(Path(args.data_dir) / "test.jsonl")
     ids = [sample["id"] for sample in samples]
-    texts = render_texts(samples, args.feature_mode, args.max_history, args.max_history_events)
+    texts = render_texts(samples, feature_mode, args.max_history, args.max_history_events)
 
     ensemble_logits = None
     id2label = None
