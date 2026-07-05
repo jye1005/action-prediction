@@ -38,6 +38,7 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "64"))
 #   autocast  -> fp16 autocast: fast but BROKEN on ModernBert (macro ~0.30). do not use.
 COMPUTE = os.environ.get("COMPUTE", "int8")  # "int8" | "fp32" | "bf16" | "autocast"
 ATTN = os.environ.get("ATTN", "")            # "" = default(sdpa); or "eager"
+SORT = os.environ.get("SORT", "1") != "0"    # length-sort batches to cut padding waste
 
 
 # ======================= embedded granite_v2 renderer =======================
@@ -268,25 +269,20 @@ def main():
     ids = [sample["id"] for sample in samples]
     texts = [render_granite_sample_v2(s, max_history_events=MAX_HISTORY_EVENTS, max_open_files=MAX_OPEN_FILES) for s in samples]
 
-    class TextDataset:
-        def __len__(self):
-            return len(texts)
+    # Pre-tokenize once, then sort by length so each batch has ~uniform length.
+    # This removes padding waste (biggest speed lever) without changing outputs.
+    collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    encs = [tokenizer(t, truncation=True, max_length=MAX_LENGTH, padding=False) for t in texts]
+    order = sorted(range(len(texts)), key=lambda i: len(encs[i]["input_ids"])) if SORT else list(range(len(texts)))
+    id2label = model.config.id2label
 
-        def __getitem__(self, idx):
-            return tokenizer(texts[idx], truncation=True, max_length=MAX_LENGTH, padding=False)
-
-    loader = DataLoader(
-        TextDataset(),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        collate_fn=DataCollatorWithPadding(tokenizer=tokenizer),
-    )
-
-    preds = []
+    preds = [None] * len(texts)
     use_autocast = COMPUTE == "autocast"
     t0 = time.time()
     with torch.no_grad():
-        for batch in loader:
+        for start in range(0, len(order), BATCH_SIZE):
+            idx = order[start:start + BATCH_SIZE]
+            batch = collator([encs[i] for i in idx])
             batch = {k: v.to(device) for k, v in batch.items()}
             with torch.amp.autocast("cuda", enabled=use_autocast and device.type == "cuda"):
                 logits = model(**batch).logits
@@ -294,8 +290,9 @@ def main():
             if bias is not None:
                 logits = logits + bias
             pred_ids = torch.argmax(logits, dim=-1).cpu().numpy().tolist()
-            preds.extend([model.config.id2label[int(i)] for i in pred_ids])
-    print(f"inference: {len(preds)} rows in {time.time() - t0:.1f}s", flush=True)
+            for j, i in enumerate(idx):
+                preds[i] = id2label[int(pred_ids[j])]
+    print(f"inference: {len(preds)} rows in {time.time() - t0:.1f}s (sort={SORT})", flush=True)
 
     pred_map = dict(zip(ids, preds))
     fieldnames, rows = load_sample_submission(data_dir / "sample_submission.csv")
