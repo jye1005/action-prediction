@@ -127,6 +127,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--margin-threshold", type=float, default=0.0,
                         help="also send base samples whose top-2 logit margin <= this to the specialist")
+    parser.add_argument("--blend-weights", default="0,0.25,0.5,0.75,1.0",
+                        help="comma list of blend weights on specialist. 0=base, 1=hard override.")
     args = parser.parse_args()
 
     print("=== eval_search_specialist v1 ===")
@@ -169,26 +171,44 @@ def main():
         lg = predict_search(d, sel_texts, args, torch_dtype)
         spec_logits = lg if spec_logits is None else spec_logits + lg
     spec_logits /= len(spec_dirs)
-    spec_global = SEARCH_TO_GLOBAL[spec_logits.argmax(1)]
 
-    final_pred = base_pred.copy()
-    final_pred[sel_idx] = spec_global
-    final_macro, final_fs = macro_f1(y_true, final_pred)
+    def softmax(x):
+        x = x - x.max(axis=1, keepdims=True)
+        e = np.exp(x)
+        return e / e.sum(axis=1, keepdims=True)
 
-    changed = int(np.sum(final_pred[sel_idx] != base_pred[sel_idx]))
-    now_right = int(np.sum((final_pred[sel_idx] == y_true[sel_idx]) & (base_pred[sel_idx] != y_true[sel_idx])))
-    now_wrong = int(np.sum((final_pred[sel_idx] != y_true[sel_idx]) & (base_pred[sel_idx] == y_true[sel_idx])))
+    # probs over the 4 exploration classes (SEARCH_CLASSES order) for selected rows
+    base_expl = softmax(base_logits[sel_idx][:, SEARCH_TO_GLOBAL])
+    spec_expl = softmax(spec_logits)
 
-    print("\n================ search specialist cascade ================")
-    print(f"specialist(s)   : {', '.join(Path(d).name for d in spec_dirs)}")
-    print(f"macro-F1  base  : {base_macro:.4f}")
-    print(f"macro-F1  cascade: {final_macro:.4f}")
-    print(f"macro-F1  delta : {final_macro - base_macro:+.4f}")
-    print(f"overridden={len(sel_idx)}  changed={changed}  fixed={now_right}  broke={now_wrong}  net={now_right - now_wrong:+d}")
-    print("\nexploration per-class F1 (base -> cascade):")
+    def eval_weight(w):
+        """w=0 -> base ranking (no change); w=1 -> hard override; between -> soft blend."""
+        blended = (1 - w) * base_expl + w * spec_expl
+        choice = SEARCH_TO_GLOBAL[blended.argmax(1)]
+        fp = base_pred.copy()
+        fp[sel_idx] = choice
+        m, fs = macro_f1(y_true, fp)
+        fixed = int(np.sum((fp[sel_idx] == y_true[sel_idx]) & (base_pred[sel_idx] != y_true[sel_idx])))
+        broke = int(np.sum((fp[sel_idx] != y_true[sel_idx]) & (base_pred[sel_idx] == y_true[sel_idx])))
+        return m, fs, fixed, broke
+
+    weights = [float(x) for x in args.blend_weights.split(",")]
+    print("\n================ search specialist: prob-blend sweep ================")
+    print(f"specialist(s) : {', '.join(Path(d).name for d in spec_dirs)}")
+    print(f"base macro-F1 : {base_macro:.4f}   (gated {len(sel_idx)}/{len(ids)})")
+    best = (-1.0, None, None)
+    for w in weights:
+        m, fs, fixed, broke = eval_weight(w)
+        tag = "  <- hard override" if w == 1.0 else ("  (base)" if w == 0.0 else "")
+        print(f"  w={w:.2f}  macro={m:.4f}  ({m - base_macro:+.4f})  fixed={fixed} broke={broke} net={fixed - broke:+d}{tag}")
+        if m > best[0]:
+            best = (m, w, fs)
+    best_m, best_w, best_fs = best
+    print(f"\nbest: w={best_w:.2f}  macro={best_m:.4f}  (delta {best_m - base_macro:+.4f})")
+    print("exploration per-class F1 (base -> best blend):")
     for c in SEARCH_CLASSES:
         i = ACTION_CLASSES.index(c)
-        print(f"  {c:16s} {base_fs[i]:.3f} -> {final_fs[i]:.3f}  ({final_fs[i] - base_fs[i]:+.3f})")
+        print(f"  {c:16s} {base_fs[i]:.3f} -> {best_fs[i]:.3f}  ({best_fs[i] - base_fs[i]:+.3f})")
 
 
 if __name__ == "__main__":
