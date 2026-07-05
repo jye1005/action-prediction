@@ -96,7 +96,7 @@ def main():
     parser.add_argument("--model-name", default="ibm-granite/granite-embedding-311m-multilingual-r2")
     parser.add_argument("--output-dir", default="./model/granite-311m-fold0")
     parser.add_argument("--split-mode", choices=["group", "stratified", "all"], default="group")
-    parser.add_argument("--feature-mode", choices=["granite", "granite_v2"], default="granite")
+    parser.add_argument("--feature-mode", choices=["granite", "granite_v2", "granite_v3"], default="granite")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--val-size", type=float, default=0.2)

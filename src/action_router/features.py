@@ -1,5 +1,6 @@
 import json
 import os
+import re
 
 
 def _safe_text(value):
@@ -253,11 +254,205 @@ def render_granite_sample_v2(sample, max_history_events=12, max_open_files=8):
     )
 
 
+# A filename-like token: something.ext where ext is 1-6 alpha chars.
+_FILE_TOKEN_RE = re.compile(r"[\w\-./]+\.[A-Za-z][A-Za-z0-9]{0,5}\b")
+# Backtick / quote wrapped short tokens are also strong "exact target" cues.
+_QUOTED_RE = re.compile(r"[`'\"]([^`'\"]{1,64})[`'\"]")
+# "N files", "N matches", "3 results", "N개", "found 2" ...
+_COUNT_RE = re.compile(
+    r"(?:found\s+)?(\d+)\s*(?:files?|matches?|results?|hits?|entries|개|건)",
+    re.IGNORECASE,
+)
+
+# Intent keyword groups. NOTE: raw read/grep keywords do NOT separate read_file
+# from grep_search well (see error analysis: 봐/open/look show up in both). So v3
+# does NOT tag the predicted action from keywords. It only emits an *intent*
+# signal that is combined with the "is an exact file already specified" state.
+_SEARCH_INTENT = [
+    "where", "anywhere", "everywhere", "across", "uses", "used", "usage",
+    "reference", "references", "call site", "callers", "similar", "pattern",
+    "어디", "전체", "호출", "사용처", "참조", "비슷", "패턴", "찾", "검색",
+]
+_READ_INTENT = [
+    "통째로", "전체를 열", "그 파일", "this file", "the file", "open the",
+    "read the", "show me the", "contents of", "내용을", "열어",
+]
+_SEARCH_ACTIONS = {"grep_search", "list_directory", "glob_pattern"}
+
+
+def _has_exact_file(text):
+    """True if the prompt names a concrete file (has an extension or is quoted)."""
+    if _FILE_TOKEN_RE.search(text):
+        return True
+    for m in _QUOTED_RE.finditer(text):
+        if _FILE_TOKEN_RE.search(m.group(1)):
+            return True
+    return False
+
+
+def _has_path(text):
+    """True if the prompt contains a directory-qualified path (dir/.../name)."""
+    for token in re.split(r"\s+", text):
+        token = token.strip("`'\"()[],")
+        if "/" in token and not token.startswith(("http://", "https://")):
+            head = token.split("/")[0]
+            if head and not head.endswith(":"):
+                return True
+    return False
+
+
+def _count_result_files(result_text):
+    """Best-effort candidate count from a search/list result summary.
+
+    Returns an int, or None when the summary gives no usable signal.
+    """
+    if not result_text:
+        return None
+    m = _COUNT_RE.search(result_text)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            pass
+    tokens = set(_FILE_TOKEN_RE.findall(result_text))
+    if tokens:
+        return len(tokens)
+    return None
+
+
+def _any_kw(text_lower, keywords):
+    return any(kw in text_lower for kw in keywords)
+
+
+def render_granite_sample_v3(sample, max_history_events=12, max_open_files=8):
+    """Granite serialization targeting the read_file vs grep_search boundary.
+
+    Keeps the useful v2 signals (short paths, arg hints, action chain) but drops
+    the v2 keyword `[HINT]` block, which reinforced the wrong "봐/open -> read"
+    shortcut. Instead it emits a `[SIG]` block of *state* features that track the
+    real decision axis: is a concrete file already specified / has it been
+    narrowed by a recent search, vs. does the user still need to locate it.
+    """
+    meta = sample.get("session_meta") or {}
+    workspace = meta.get("workspace") or {}
+    history = sample.get("history") or []
+    recent_history = history[-max_history_events:]
+
+    open_files = workspace.get("open_files") or []
+    language_mix = workspace.get("language_mix") or {}
+    main_lang = ""
+    if language_mix:
+        main_lang = max(language_mix.items(), key=lambda item: item[1])[0]
+
+    meta_text = " ".join(
+        [
+            f"tier={_safe_text(meta.get('user_tier'))}",
+            f"pref={_safe_text(meta.get('language_pref'))}",
+            f"turn={_safe_text(meta.get('turn_index'))}",
+            f"budget={_budget_bucket(meta.get('budget_tokens_remaining'))}",
+            f"elapsed={_elapsed_bucket(meta.get('elapsed_session_sec'))}",
+            f"lang={main_lang}",
+            f"ci={_safe_text(workspace.get('last_ci_status'))}",
+            f"git={'dirty' if workspace.get('git_dirty') else 'clean'}",
+            f"open={len(open_files)}",
+            f"loc={_safe_text(workspace.get('loc'))}",
+        ]
+    )
+
+    path_parts = []
+    ext_parts = []
+    for path in open_files[-max_open_files:]:
+        short_path, ext = _path_summary(path)
+        if short_path:
+            path_parts.append(short_path)
+        if ext:
+            ext_parts.append(ext)
+
+    action_names = []
+    arg_parts = []
+    hist_parts = []
+    last_search_action = ""
+    last_search_result = ""
+    for item in recent_history:
+        role = item.get("role", "")
+        if role == "user":
+            hist_parts.append(f"U: {_safe_text(item.get('content'))}")
+        elif role == "assistant_action":
+            name = _safe_text(item.get("name"))
+            args = item.get("args") or {}
+            result = _safe_text(item.get("result_summary"))
+            action_names.append(name)
+            arg_hints = _extract_arg_hints(args)
+            if arg_hints:
+                arg_parts.append(f"{name} " + " ".join(arg_hints))
+            hist_parts.append(f"A[{name}] {_compact_json(args)} -> {result}")
+            if name in _SEARCH_ACTIONS:
+                last_search_action = name
+                last_search_result = result
+
+    current_prompt = _safe_text(sample.get("current_prompt"))
+    prompt_lower = current_prompt.lower()
+
+    exact_file = _has_exact_file(current_prompt)
+    has_path = _has_path(current_prompt)
+    search_intent = _any_kw(prompt_lower, [k.lower() for k in _SEARCH_INTENT])
+    read_intent = _any_kw(prompt_lower, [k.lower() for k in _READ_INTENT])
+    prev_search = bool(last_search_action)
+    cand = _count_result_files(last_search_result) if prev_search else None
+    if cand is None:
+        cand_bucket = "na"
+    elif cand <= 0:
+        cand_bucket = "none"
+    elif cand == 1:
+        cand_bucket = "single"
+    else:
+        cand_bucket = "multi"
+
+    sig_text = " ".join(
+        [
+            f"exact_file={int(exact_file)}",
+            f"path={int(has_path)}",
+            f"search_intent={int(search_intent)}",
+            f"read_intent={int(read_intent)}",
+            f"prev_search={int(prev_search)}",
+            f"prev_action={last_search_action or 'none'}",
+            f"cand={cand_bucket}",
+        ]
+    )
+
+    return " ".join(
+        [
+            "[META]",
+            meta_text,
+            "[FILES]",
+            " | ".join(path_parts),
+            "[EXT]",
+            " ".join(sorted(set(ext_parts))),
+            "[ACT]",
+            " > ".join(action_names[-6:]),
+            "[ARGS]",
+            " | ".join(arg_parts[-6:]),
+            "[SIG]",
+            sig_text,
+            "[HIST]",
+            " | ".join(hist_parts),
+            "[CUR]",
+            current_prompt,
+        ]
+    )
+
+
 def render_granite_text(sample, max_history_events=12, feature_mode="granite", max_open_files=8):
     if feature_mode == "granite":
         return render_granite_sample(sample, max_history_events=max_history_events)
     if feature_mode == "granite_v2":
         return render_granite_sample_v2(
+            sample,
+            max_history_events=max_history_events,
+            max_open_files=max_open_files,
+        )
+    if feature_mode == "granite_v3":
+        return render_granite_sample_v3(
             sample,
             max_history_events=max_history_events,
             max_open_files=max_open_files,

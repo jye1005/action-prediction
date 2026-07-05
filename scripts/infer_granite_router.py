@@ -51,7 +51,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--max-history-events", type=int, default=12)
-    parser.add_argument("--feature-mode", choices=["granite", "granite_v2", "auto"], default="auto")
+    parser.add_argument("--feature-mode", choices=["granite", "granite_v2", "granite_v3", "auto"], default="auto")
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args()
 
