@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "src"))
 
-from action_router.features import render_granite_sample
+from action_router.features import render_granite_text
 
 
 def load_jsonl(path):
@@ -51,6 +51,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--max-history-events", type=int, default=12)
+    parser.add_argument("--feature-mode", choices=["granite", "granite_v2", "auto"], default="auto")
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args()
 
@@ -77,6 +78,15 @@ def main():
 
     model_dir = Path(args.model_dir)
     model_name_or_path = str(model_dir) if model_dir.exists() else args.model_dir
+    feature_mode = args.feature_mode
+    if feature_mode == "auto":
+        meta_path = model_dir / "training_meta.json"
+        if meta_path.exists():
+            with open(meta_path, encoding="utf-8") as f:
+                feature_mode = json.load(f).get("feature_mode", "granite")
+        else:
+            feature_mode = "granite"
+    print(f"feature_mode={feature_mode}")
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, local_files_only=args.local_files_only)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name_or_path,
@@ -91,7 +101,10 @@ def main():
 
     samples = load_jsonl(Path(args.data_dir) / "test.jsonl")
     ids = [sample["id"] for sample in samples]
-    texts = [render_granite_sample(sample, max_history_events=args.max_history_events) for sample in samples]
+    texts = [
+        render_granite_text(sample, max_history_events=args.max_history_events, feature_mode=feature_mode)
+        for sample in samples
+    ]
 
     loader = DataLoader(
         TextDataset(texts, tokenizer, args.max_length),

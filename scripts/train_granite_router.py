@@ -13,7 +13,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "src"))
 
 from action_router.constants import ACTION_CLASSES, ID2LABEL, LABEL2ID
-from action_router.features import render_granite_sample, session_group
+from action_router.features import render_granite_text, session_group
 from action_router.split import split_train_val
 
 
@@ -48,7 +48,7 @@ def load_labels(path):
         return {row["id"]: row["action"] for row in csv.DictReader(f)}
 
 
-def build_data(data_dir, max_history_events):
+def build_data(data_dir, max_history_events, feature_mode):
     samples = load_jsonl(Path(data_dir) / "train.jsonl")
     labels = load_labels(Path(data_dir) / "train_labels.csv")
     texts = []
@@ -56,7 +56,7 @@ def build_data(data_dir, max_history_events):
     groups = []
     for sample in samples:
         sample_id = sample["id"]
-        texts.append(render_granite_sample(sample, max_history_events=max_history_events))
+        texts.append(render_granite_text(sample, max_history_events=max_history_events, feature_mode=feature_mode))
         y.append(LABEL2ID[labels[sample_id]])
         groups.append(session_group(sample_id))
     return np.array(texts, dtype=object), np.array(y, dtype=np.int64), np.array(groups, dtype=object)
@@ -96,6 +96,7 @@ def main():
     parser.add_argument("--model-name", default="ibm-granite/granite-embedding-311m-multilingual-r2")
     parser.add_argument("--output-dir", default="./model/granite-311m-fold0")
     parser.add_argument("--split-mode", choices=["group", "stratified", "all"], default="group")
+    parser.add_argument("--feature-mode", choices=["granite", "granite_v2"], default="granite")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--val-size", type=float, default=0.2)
@@ -125,7 +126,7 @@ def main():
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    texts, y, groups = build_data(args.data_dir, args.max_history_events)
+    texts, y, groups = build_data(args.data_dir, args.max_history_events, args.feature_mode)
 
     train_texts, val_texts, y_train, y_val, has_val, _, _ = split_train_val(
         texts, y, groups, args.split_mode, args.fold, args.n_splits, args.val_size, args.seed
@@ -226,6 +227,7 @@ def main():
                 "split_mode": args.split_mode,
                 "max_length": args.max_length,
                 "max_history_events": args.max_history_events,
+                "feature_mode": args.feature_mode,
                 "action_classes": ACTION_CLASSES,
             }
             if has_val:

@@ -253,5 +253,17 @@ def render_granite_sample_v2(sample, max_history_events=12, max_open_files=8):
     )
 
 
+def render_granite_text(sample, max_history_events=12, feature_mode="granite", max_open_files=8):
+    if feature_mode == "granite":
+        return render_granite_sample(sample, max_history_events=max_history_events)
+    if feature_mode == "granite_v2":
+        return render_granite_sample_v2(
+            sample,
+            max_history_events=max_history_events,
+            max_open_files=max_open_files,
+        )
+    raise ValueError(f"unknown granite feature_mode: {feature_mode}")
+
+
 def session_group(sample_id):
     return _safe_text(sample_id).split("-step_", 1)[0]
