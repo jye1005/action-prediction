@@ -187,6 +187,14 @@ def main():
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+    # ModernBert (granite) triggers torch.compile internally; dynamo can't trace
+    # bitsandbytes' int8 autograd fn and errors. Fall back to eager.
+    try:
+        import torch._dynamo
+        torch._dynamo.config.suppress_errors = True
+    except Exception:  # noqa: BLE001
+        pass
+
     torch_dtype = getattr(torch, DTYPE_MAP[args.dtype])
     # Module-name fragments bnb should NOT quantize (classification head + norms).
     skip_modules = ["classifier", "score", "pre_classifier", "head"] if args.keep_head_fp else None
@@ -205,7 +213,7 @@ def main():
     fp_macro = base_macro
     if not args.skip_fp:
         model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_dir, local_files_only=True, torch_dtype=torch_dtype
+            args.model_dir, local_files_only=True, torch_dtype=torch_dtype, reference_compile=False
         )
         model.to(device)
         bias_vals = load_logit_bias(args.model_dir, model.config.id2label)
@@ -228,7 +236,7 @@ def main():
         print(f"bnb 8bit  dtype={args.dtype}  skip_modules={skip_modules}")
         q_model = AutoModelForSequenceClassification.from_pretrained(
             args.model_dir, local_files_only=True, quantization_config=qconf,
-            torch_dtype=torch_dtype, device_map="auto",
+            torch_dtype=torch_dtype, device_map="auto", reference_compile=False,
         )
         q_device = next(q_model.parameters()).device
         bias_vals = load_logit_bias(args.model_dir, q_model.config.id2label)
@@ -243,7 +251,9 @@ def main():
             int8_mb = float("nan")
             print(f"warning: could not serialize int8 model for size measurement: {e}")
     else:  # dynamic (CPU)
-        model = AutoModelForSequenceClassification.from_pretrained(args.model_dir, local_files_only=True)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            args.model_dir, local_files_only=True, reference_compile=False
+        )
         model.to("cpu").eval()
         q_model = torch.ao.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
         bias_vals = load_logit_bias(args.model_dir, model.config.id2label)
