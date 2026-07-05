@@ -31,10 +31,12 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "64"))
 # Proven-fast pattern (matches a passing submission): load default (fp32) + fp16
 # autocast + default sdpa attention. fp32 master weights => no NaN; fp16 compute
 # uses T4 tensor cores => fast. (bf16 is slow on T4; eager attn is slow.)
-# Benchmark knobs (defaults = fast; set to reproduce the slow combo):
-#   COMPUTE=bf16 ATTN=eager   -> the old timed-out configuration
-COMPUTE = os.environ.get("COMPUTE", "autocast")  # "autocast" (fp32+fp16) | "bf16"
-ATTN = os.environ.get("ATTN", "")                 # "" = default(sdpa); or "eager"
+# dtype choice on T4:
+#   fp32      -> accurate (~0.78), native FP32 cores (faster than emulated bf16). DEFAULT.
+#   bf16      -> accurate (0.783) but SLOW on T4 (no bf16 tensor cores) -> timed out.
+#   autocast  -> fp16 autocast: FAST but BROKEN on ModernBert (macro ~0.30). do not use.
+COMPUTE = os.environ.get("COMPUTE", "fp32")  # "fp32" | "bf16" | "autocast"
+ATTN = os.environ.get("ATTN", "")            # "" = default(sdpa); or "eager"
 
 
 # ======================= embedded granite_v2 renderer =======================
