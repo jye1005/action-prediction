@@ -17,6 +17,8 @@ sys.path.insert(0, str(ROOT_DIR / "src"))
 from action_router.features import render_granite_sample, session_group
 
 
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
 SEARCH_CLASSES = ["read_file", "grep_search", "list_directory", "glob_pattern"]
 SEARCH_LABEL2ID = {label: idx for idx, label in enumerate(SEARCH_CLASSES)}
 SEARCH_ID2LABEL = {idx: label for label, idx in SEARCH_LABEL2ID.items()}
@@ -123,6 +125,7 @@ def main():
     args = parser.parse_args()
 
     import torch
+    import torch._dynamo
     from torch.utils.data import DataLoader
     from transformers import (
         AutoModelForSequenceClassification,
@@ -132,6 +135,7 @@ def main():
         set_seed,
     )
 
+    torch._dynamo.config.suppress_errors = True
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     texts, y, groups = build_data(args.data_dir, args.max_history_events)
