@@ -27,10 +27,10 @@ MODEL_DIR = os.environ.get("MODEL_DIR", "./model/granite-311m-v2-fold0-1")
 MAX_LENGTH = int(os.environ.get("MAX_LENGTH", "512"))
 MAX_HISTORY_EVENTS = 12
 MAX_OPEN_FILES = 8
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "256"))
-# T4 has no bf16 tensor cores (slow); fp16 NaNs on ModernBert. sdpa >> eager for speed.
-ATTN = os.environ.get("ATTN", "sdpa")
-DTYPE = os.environ.get("DTYPE", "bf16")  # bf16 | fp32
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "64"))
+# Proven-fast pattern (matches a passing submission): load default (fp32) + fp16
+# autocast + default sdpa attention. fp32 master weights => no NaN; fp16 compute
+# uses T4 tensor cores => fast. (bf16 is slow on T4; eager attn is slow.)
 
 
 # ======================= embedded granite_v2 renderer =======================
@@ -218,19 +218,12 @@ def main():
     data_dir = Path(os.environ.get("DATA_DIR", "./data"))
     model_dir = Path(MODEL_DIR)
     output_path = Path("./output/submission.csv")
-    torch_dtype = torch.float32 if DTYPE == "fp32" else torch.bfloat16
-    print(f"attn={ATTN} dtype={DTYPE} batch={BATCH_SIZE} max_len={MAX_LENGTH}", flush=True)
+    print(f"batch={BATCH_SIZE} max_len={MAX_LENGTH} (fp32 load + fp16 autocast + default attn)", flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
-    # NOTE: never fp16 -> ModernBert overflows to NaN. bf16 (or fp32) only.
-    # sdpa >> eager for speed; bf16 is slow on T4 (no bf16 tensor cores) so fp32
-    # may actually be faster there -- try DTYPE=fp32 if bf16 is the bottleneck.
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_dir,
-        local_files_only=True,
-        torch_dtype=torch_dtype,
-        attn_implementation=ATTN,
-    )
+    # default load = fp32 master weights; fp16 autocast in the loop keeps it stable
+    # AND fast on T4. Do NOT force torch_dtype=fp16 (pure fp16 can NaN on ModernBert).
+    model = AutoModelForSequenceClassification.from_pretrained(model_dir, local_files_only=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
@@ -261,7 +254,9 @@ def main():
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            logits = model(**batch).logits.float()  # no autocast
+            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                logits = model(**batch).logits
+            logits = logits.float()
             if bias is not None:
                 logits = logits + bias
             pred_ids = torch.argmax(logits, dim=-1).cpu().numpy().tolist()
