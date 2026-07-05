@@ -218,7 +218,7 @@ def main():
     print("=== verify_int8 v4 (feature_mode + reorder + eager + diagnostics) ===")
 
     import torch
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
     # ModernBert (granite) triggers torch.compile internally; dynamo can't trace
     # bitsandbytes' int8 autograd fn and errors. Fall back to eager.
@@ -227,6 +227,16 @@ def main():
         torch._dynamo.config.suppress_errors = True
     except Exception:  # noqa: BLE001
         pass
+
+    # reference_compile / eager are ModernBert-only kwargs; XLM-R (bge) rejects
+    # reference_compile with a TypeError. Only pass them for ModernBert.
+    _cfg = AutoConfig.from_pretrained(args.model_dir, local_files_only=True)
+    _archs = getattr(_cfg, "architectures", None) or []
+    is_modernbert = "modernbert" in (getattr(_cfg, "model_type", "") or "").lower() or any(
+        "modernbert" in a.lower() for a in _archs
+    )
+    extra_kwargs = {"reference_compile": False, "attn_implementation": args.attn_implementation} if is_modernbert else {}
+    print(f"model_type={getattr(_cfg, 'model_type', None)} is_modernbert={is_modernbert} extra_kwargs={list(extra_kwargs)}")
 
     torch_dtype = getattr(torch, DTYPE_MAP[args.dtype])
     # Module-name fragments bnb should NOT quantize (classification head + norms).
@@ -248,8 +258,7 @@ def main():
     fp_macro = base_macro
     if not args.skip_fp:
         model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_dir, local_files_only=True, torch_dtype=torch_dtype,
-            reference_compile=False, attn_implementation=args.attn_implementation,
+            args.model_dir, local_files_only=True, torch_dtype=torch_dtype, **extra_kwargs
         )
         model.to(device)
         print(f"config.id2label = {dict(model.config.id2label)}")
@@ -276,8 +285,7 @@ def main():
         print(f"bnb 8bit  dtype={args.dtype}  skip_modules={skip_modules}")
         q_model = AutoModelForSequenceClassification.from_pretrained(
             args.model_dir, local_files_only=True, quantization_config=qconf,
-            torch_dtype=torch_dtype, device_map="auto", reference_compile=False,
-            attn_implementation=args.attn_implementation,
+            torch_dtype=torch_dtype, device_map="auto", **extra_kwargs,
         )
         q_device = next(q_model.parameters()).device
         bias_vals = load_logit_bias(args.model_dir, q_model.config.id2label)
@@ -293,8 +301,7 @@ def main():
             print(f"warning: could not serialize int8 model for size measurement: {e}")
     else:  # dynamic (CPU)
         model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_dir, local_files_only=True, reference_compile=False,
-            attn_implementation=args.attn_implementation,
+            args.model_dir, local_files_only=True, **extra_kwargs
         )
         model.to("cpu").eval()
         q_model = torch.ao.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
