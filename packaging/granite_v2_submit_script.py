@@ -31,11 +31,12 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "64"))
 # Proven-fast pattern (matches a passing submission): load default (fp32) + fp16
 # autocast + default sdpa attention. fp32 master weights => no NaN; fp16 compute
 # uses T4 tensor cores => fast. (bf16 is slow on T4; eager attn is slow.)
-# dtype choice on T4:
-#   fp32      -> accurate (~0.78), native FP32 cores (faster than emulated bf16). DEFAULT.
-#   bf16      -> accurate (0.783) but SLOW on T4 (no bf16 tensor cores) -> timed out.
-#   autocast  -> fp16 autocast: FAST but BROKEN on ModernBert (macro ~0.30). do not use.
-COMPUTE = os.environ.get("COMPUTE", "fp32")  # "fp32" | "bf16" | "autocast"
+# dtype choice on T4 (int8 & fp32 are accurate AND have native T4 acceleration):
+#   int8      -> accurate (0.7825), T4 int8 tensor cores = fast. needs bitsandbytes. DEFAULT.
+#   fp32      -> accurate (0.7831), native FP32 cores. no bnb. medium speed.
+#   bf16      -> accurate (0.7829) but SLOW on T4 (no bf16 tensor cores) -> timed out.
+#   autocast  -> fp16 autocast: fast but BROKEN on ModernBert (macro ~0.30). do not use.
+COMPUTE = os.environ.get("COMPUTE", "int8")  # "int8" | "fp32" | "bf16" | "autocast"
 ATTN = os.environ.get("ATTN", "")            # "" = default(sdpa); or "eager"
 
 
@@ -220,6 +221,13 @@ def main():
     from torch.utils.data import DataLoader
     from transformers import AutoModelForSequenceClassification, AutoTokenizer, DataCollatorWithPadding
 
+    # ModernBert triggers torch.compile; dynamo can't trace bnb int8 -> fall back to eager.
+    try:
+        import torch._dynamo
+        torch._dynamo.config.suppress_errors = True
+    except Exception:  # noqa: BLE001
+        pass
+
     # Submission: server provides ./data. Local test: set DATA_DIR=../data.
     data_dir = Path(os.environ.get("DATA_DIR", "./data"))
     model_dir = Path(MODEL_DIR)
@@ -227,15 +235,30 @@ def main():
     print(f"batch={BATCH_SIZE} max_len={MAX_LENGTH} compute={COMPUTE} attn={ATTN or 'default'}", flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
-    # default: fp32 master weights + fp16 autocast in the loop -> stable AND fast.
-    load_kwargs = {"local_files_only": True}
-    if ATTN:
-        load_kwargs["attn_implementation"] = ATTN
-    if COMPUTE == "bf16":
-        load_kwargs["torch_dtype"] = torch.bfloat16
-    model = AutoModelForSequenceClassification.from_pretrained(model_dir, **load_kwargs)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    attn = ATTN or "sdpa"
+    if COMPUTE == "int8":
+        # Load the fp16 checkpoint quantized to int8 (T4 int8 tensor cores = fast,
+        # accuracy ~0.7825). Keep the classification head in fp (skip_modules) or
+        # it collapses. No autocast; bnb handles compute dtype.
+        from transformers import BitsAndBytesConfig
+        qconf = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_skip_modules=["classifier", "score", "pre_classifier", "head"],
+        )
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_dir, local_files_only=True, quantization_config=qconf,
+            device_map="auto", reference_compile=False, attn_implementation=attn,
+        )
+        device = next(model.parameters()).device
+    else:
+        load_kwargs = {"local_files_only": True}
+        if ATTN:
+            load_kwargs["attn_implementation"] = ATTN
+        if COMPUTE == "bf16":
+            load_kwargs["torch_dtype"] = torch.bfloat16
+        model = AutoModelForSequenceClassification.from_pretrained(model_dir, **load_kwargs)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
     model.eval()
 
     bias_values = load_logit_bias(model_dir, model.config.id2label)
