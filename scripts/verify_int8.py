@@ -58,12 +58,28 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "src"))
 
 from action_router.constants import ACTION_CLASSES  # noqa: E402
-from action_router.features import render_granite_sample, render_sample  # noqa: E402
+from action_router.features import render_granite_text, render_sample  # noqa: E402
 
-RENDERERS = {
-    "granite": lambda s: render_granite_sample(s, max_history_events=12),
-    "e5": lambda s: render_sample(s, max_history=8),
-}
+
+def resolve_feature_mode(model_dir, override):
+    """feature_mode decides the input text format (granite / granite_v2 / v3).
+    Mismatch => the model sees the wrong text => near-random macro.
+    Priority: explicit override > training_meta.json > 'granite'."""
+    if override:
+        return override
+    meta = Path(model_dir) / "training_meta.json"
+    if meta.exists():
+        with open(meta, encoding="utf-8") as f:
+            fm = json.load(f).get("feature_mode")
+            if fm:
+                return fm
+    return "granite"
+
+
+def make_renderer(kind, feature_mode):
+    if kind == "e5":
+        return lambda s: render_sample(s, max_history=8)
+    return lambda s: render_granite_text(s, max_history_events=12, feature_mode=feature_mode)
 
 
 def macro_f1(y_true, y_pred, n_classes=len(ACTION_CLASSES)):
@@ -180,7 +196,9 @@ def main():
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--baseline-npz", required=True,
                         help="Existing fp dump (ids/y_true/probs) to compare against and match eval set.")
-    parser.add_argument("--renderer", choices=list(RENDERERS), default="granite")
+    parser.add_argument("--renderer", choices=["granite", "e5"], default="granite")
+    parser.add_argument("--feature-mode", default=None,
+                        help="granite/granite_v2/granite_v3. Default: read from model's training_meta.json.")
     parser.add_argument("--method", choices=["bnb", "dynamic"], default="bnb")
     parser.add_argument("--out-npz", default=None)
     parser.add_argument("--max-length", type=int, default=512)
@@ -191,9 +209,13 @@ def main():
                         help="Keep the classification head out of int8 (bnb). On by default; encoder heads collapse if quantized.")
     parser.add_argument("--quantize-head", dest="keep_head_fp", action="store_false",
                         help="Force-quantize the head too (to reproduce the collapse).")
+    parser.add_argument("--attn-implementation", default="eager",
+                        help="granite/ModernBert needs 'eager' (matches make_teacher_logits.py).")
     parser.add_argument("--skip-fp", action="store_true",
                         help="Trust baseline npz as the fp reference instead of recomputing it.")
     args = parser.parse_args()
+
+    print("=== verify_int8 v4 (feature_mode + reorder + eager + diagnostics) ===")
 
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -210,7 +232,9 @@ def main():
     # Module-name fragments bnb should NOT quantize (classification head + norms).
     skip_modules = ["classifier", "score", "pre_classifier", "head"] if args.keep_head_fp else None
 
-    renderer = RENDERERS[args.renderer]
+    feature_mode = resolve_feature_mode(args.model_dir, args.feature_mode)
+    renderer = make_renderer(args.renderer, feature_mode)
+    print(f"renderer={args.renderer}  feature_mode={feature_mode}")
     ids, texts, y_true, base_probs = build_eval_set(args.data_dir, args.baseline_npz, renderer)
     print(f"eval set: {len(ids)} samples reconstructed from {args.baseline_npz}")
 
@@ -224,13 +248,18 @@ def main():
     fp_macro = base_macro
     if not args.skip_fp:
         model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_dir, local_files_only=True, torch_dtype=torch_dtype, reference_compile=False
+            args.model_dir, local_files_only=True, torch_dtype=torch_dtype,
+            reference_compile=False, attn_implementation=args.attn_implementation,
         )
         model.to(device)
+        print(f"config.id2label = {dict(model.config.id2label)}")
         bias_vals = load_logit_bias(args.model_dir, model.config.id2label)
         bias = torch.tensor(bias_vals, device=device) if bias_vals else None
         fp_logits = run_inference(model, tokenizer, texts, device, args.max_length, args.batch_size, bias, model.config.id2label)
         fp_macro = macro_f1(y_true, fp_logits.argmax(1))
+        pred = fp_logits.argmax(1)
+        dist = {ACTION_CLASSES[c]: int((pred == c).sum()) for c in range(len(ACTION_CLASSES))}
+        print(f"pred distribution: {dist}")
         print(f"[{args.dtype} recompute] macro-F1 = {fp_macro:.4f}  (drift vs npz: {fp_macro - base_macro:+.4f})")
         del model
         if device.type == "cuda":
@@ -248,6 +277,7 @@ def main():
         q_model = AutoModelForSequenceClassification.from_pretrained(
             args.model_dir, local_files_only=True, quantization_config=qconf,
             torch_dtype=torch_dtype, device_map="auto", reference_compile=False,
+            attn_implementation=args.attn_implementation,
         )
         q_device = next(q_model.parameters()).device
         bias_vals = load_logit_bias(args.model_dir, q_model.config.id2label)
@@ -263,7 +293,8 @@ def main():
             print(f"warning: could not serialize int8 model for size measurement: {e}")
     else:  # dynamic (CPU)
         model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_dir, local_files_only=True, reference_compile=False
+            args.model_dir, local_files_only=True, reference_compile=False,
+            attn_implementation=args.attn_implementation,
         )
         model.to("cpu").eval()
         q_model = torch.ao.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
