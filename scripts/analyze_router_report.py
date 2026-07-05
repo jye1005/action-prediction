@@ -1,3 +1,10 @@
+"""Print OOF/validation classification report and margin stats for router models.
+
+Supports:
+- one model dir + --fold N  -> single-fold validation report
+- multiple model dirs       -> full K-fold OOF report (ensemble-style scoring)
+"""
+
 import argparse
 import csv
 import json
@@ -82,9 +89,11 @@ def print_bucket_stats(name, values, correct, thresholds, lower_is_uncertain=Tru
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Print validation/OOF classification report and margin stats for one or more router models."
+    )
     parser.add_argument("--data-dir", default="./data")
-    parser.add_argument("--model-dirs", required=True)
+    parser.add_argument("--model-dirs", required=True, help="One model dir, or comma-separated fold model dirs.")
     parser.add_argument("--feature-mode", choices=["granite", "granite_v2", "sample", "auto"], default="auto")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=512)
