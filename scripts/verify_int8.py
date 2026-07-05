@@ -121,12 +121,16 @@ def load_logit_bias(model_dir, id2label):
 DTYPE_MAP = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}
 
 
-def run_inference(model, tokenizer, texts, device, max_length, batch_size, bias):
-    """Run in the model's own dtype (no autocast).
+def run_inference(model, tokenizer, texts, device, max_length, batch_size, bias, id2label):
+    """Run in the model's own dtype (no autocast) and return logits in
+    ACTION_CLASSES column order.
 
-    autocast forces fp16, which makes ModernBert (granite-embedding) overflow to
-    NaN. Loading the model in bf16/fp32 and running WITHOUT autocast avoids the
-    dtype mismatch entirely.
+    Two things this guards against:
+    - autocast forces fp16, which makes ModernBert (granite-embedding) overflow
+      to NaN. Loading in bf16/fp32 and running WITHOUT autocast avoids it.
+    - a model's config.id2label order may NOT equal ACTION_CLASSES. The training
+      script reorders OOF columns defensively; we must match, or argmax indices
+      won't line up with the npz y_true (-> near-random macro).
     """
     import torch
     from torch.utils.data import DataLoader
@@ -151,10 +155,17 @@ def run_inference(model, tokenizer, texts, device, max_length, batch_size, bias)
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             logits = model(**batch).logits.float()
-            if bias is not None:
+            if bias is not None:  # bias is in model (id2label) order, applied pre-reorder
                 logits = logits + bias
             all_logits.append(logits.cpu().numpy())
-    return np.concatenate(all_logits, axis=0)
+    out = np.concatenate(all_logits, axis=0)
+
+    # Reorder columns model-order -> ACTION_CLASSES order.
+    label2id = {id2label[i]: i for i in range(out.shape[1])}
+    col_order = [label2id[name] for name in ACTION_CLASSES]
+    if col_order != list(range(out.shape[1])):
+        print(f"note: reordering logit columns to ACTION_CLASSES (model order != canonical): {col_order}")
+    return out[:, col_order]
 
 
 def softmax(x):
@@ -218,7 +229,7 @@ def main():
         model.to(device)
         bias_vals = load_logit_bias(args.model_dir, model.config.id2label)
         bias = torch.tensor(bias_vals, device=device) if bias_vals else None
-        fp_logits = run_inference(model, tokenizer, texts, device, args.max_length, args.batch_size, bias)
+        fp_logits = run_inference(model, tokenizer, texts, device, args.max_length, args.batch_size, bias, model.config.id2label)
         fp_macro = macro_f1(y_true, fp_logits.argmax(1))
         print(f"[{args.dtype} recompute] macro-F1 = {fp_macro:.4f}  (drift vs npz: {fp_macro - base_macro:+.4f})")
         del model
@@ -241,7 +252,7 @@ def main():
         q_device = next(q_model.parameters()).device
         bias_vals = load_logit_bias(args.model_dir, q_model.config.id2label)
         bias = torch.tensor(bias_vals, device=q_device) if bias_vals else None
-        int8_logits = run_inference(q_model, tokenizer, texts, q_device, args.max_length, args.batch_size, bias)
+        int8_logits = run_inference(q_model, tokenizer, texts, q_device, args.max_length, args.batch_size, bias, q_model.config.id2label)
         int8_dir = Path(args.model_dir).parent / (Path(args.model_dir).name + "-int8")
         try:
             q_model.save_pretrained(int8_dir)
@@ -258,7 +269,7 @@ def main():
         q_model = torch.ao.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
         bias_vals = load_logit_bias(args.model_dir, model.config.id2label)
         bias = torch.tensor(bias_vals) if bias_vals else None
-        int8_logits = run_inference(q_model, tokenizer, texts, torch.device("cpu"), args.max_length, args.batch_size, bias)
+        int8_logits = run_inference(q_model, tokenizer, texts, torch.device("cpu"), args.max_length, args.batch_size, bias, model.config.id2label)
         int8_dir = Path(args.model_dir).parent / (Path(args.model_dir).name + "-int8-dynamic")
         int8_dir.mkdir(parents=True, exist_ok=True)
         torch.save(q_model.state_dict(), int8_dir / "int8_state.pt")
