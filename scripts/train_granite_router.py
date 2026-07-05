@@ -115,6 +115,13 @@ def main():
         help="Optional .npz path to save best-epoch validation OOF (ids, y_true, "
         "logits, probs in ACTION_CLASSES order) for learning ensemble/stacking weights.",
     )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Skip training. Load the saved model in --output-dir, reproduce the same "
+        "fold's validation split, and dump OOF to --oof-path. Fold/feature settings are "
+        "read from training_meta.json so the OOF matches the original run.",
+    )
     parser.add_argument("--split-mode", choices=["group", "stratified", "all"], default="group")
     parser.add_argument("--feature-mode", choices=["granite", "granite_v2", "granite_v3"], default="granite")
     parser.add_argument("--fold", type=int, default=0)
@@ -146,6 +153,27 @@ def main():
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model_source = args.model_name
+    if args.eval_only:
+        if not args.oof_path:
+            raise SystemExit("--eval-only requires --oof-path")
+        meta_path = Path(args.output_dir) / "training_meta.json"
+        if meta_path.exists():
+            with open(meta_path, encoding="utf-8") as f:
+                saved = json.load(f)
+            args.feature_mode = saved.get("feature_mode", args.feature_mode)
+            args.split_mode = saved.get("split_mode", args.split_mode)
+            args.fold = saved.get("fold", args.fold)
+            args.n_splits = saved.get("n_splits", args.n_splits)
+            args.max_length = saved.get("max_length", args.max_length)
+            args.max_history_events = saved.get("max_history_events", args.max_history_events)
+        model_source = args.output_dir
+        print(
+            f"[eval-only] model={model_source} feature_mode={args.feature_mode} "
+            f"split={args.split_mode} fold={args.fold}/{args.n_splits}"
+        )
+
     ids, texts, y, groups = build_data(args.data_dir, args.max_history_events, args.feature_mode)
 
     train_texts, val_texts, y_train, y_val, has_val, _, val_idx = split_train_val(
@@ -157,9 +185,9 @@ def main():
     else:
         print(f"train={len(train_texts)} val=0 split=all")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True)
     model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name,
+        model_source,
         num_labels=len(ACTION_CLASSES),
         id2label=ID2LABEL,
         label2id=LABEL2ID,
@@ -184,6 +212,32 @@ def main():
             collate_fn=collator,
             num_workers=2,
         )
+
+    if args.eval_only:
+        if not has_val:
+            raise SystemExit("--eval-only needs a validation split (use split-mode group/stratified)")
+        macro_f1, val_logits, val_gold = evaluate(
+            model, val_loader, device, args.fp16, return_logits=True
+        )
+        print(f"[eval-only] val_macro_f1={macro_f1:.5f}")
+        label2id = {model.config.id2label[i]: i for i in range(val_logits.shape[1])}
+        col_order = [label2id[name] for name in ACTION_CLASSES]
+        ordered = val_logits[:, col_order].astype(np.float32)
+        shifted = ordered - ordered.max(axis=1, keepdims=True)
+        exp = np.exp(shifted)
+        probs = (exp / exp.sum(axis=1, keepdims=True)).astype(np.float32)
+        oof_out = Path(args.oof_path)
+        os.makedirs(oof_out.parent, exist_ok=True)
+        np.savez(
+            oof_out,
+            ids=np.array(val_ids),
+            y_true=np.asarray(val_gold, dtype=np.int64),
+            classes=np.array(ACTION_CLASSES),
+            logits=ordered,
+            probs=probs,
+        )
+        print(f"[eval-only] saved OOF to {args.oof_path} shape={probs.shape}")
+        return
 
     weights = torch.tensor(class_weights(y_train), dtype=torch.float32, device=device)
     criterion = torch.nn.CrossEntropyLoss(weight=weights)
